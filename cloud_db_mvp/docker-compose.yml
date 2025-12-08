@@ -1,0 +1,19 @@
+version: '3.8'
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: cloud_db_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: admin@123 # Sửa lại cho khớp với .env
+      MYSQL_DATABASE: admin_db
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    command: --default-authentication-plugin=mysql_native_password
+volumes:
+  mysql_data:
+# Ghi chú: Đổi MYSQL_ROOT_PASSWORD cho khớp với file .env bạn dùng!
+# Command trên sẽ set MySQL dùng mysql_native_password thay vì caching_sha2_password
+# để tránh lỗi "Public Key Retrieval is not allowed" với PyMySQL

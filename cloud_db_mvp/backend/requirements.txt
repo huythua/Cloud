@@ -1,0 +1,11 @@
+# requirements.txt - Python dependencies for Cloud DB MVP backend
+# Cài đặt bằng: pip install -r requirements.txt
+
+fastapi
+uvicorn[standard]
+sqlalchemy
+pydantic
+python-jose[cryptography]
+passlib[bcrypt]
+PyMySQL
+alembic
