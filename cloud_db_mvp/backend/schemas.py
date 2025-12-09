@@ -32,7 +32,7 @@ class DatabaseOut(BaseModel):
     id: int
     name: str
     owner_id: int
-    quota_mb: int
+    quota_mb: Optional[int] = None  # quota có thể chưa đặt => None
     status: str
     hostname: Optional[str]
     port: Optional[int]

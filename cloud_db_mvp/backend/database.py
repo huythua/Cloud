@@ -13,13 +13,8 @@ DATABASE_URL = os.getenv("METADATA_DATABASE_URL", "sqlite:///./metadata.db")
 # Xử lý connect_args dựa trên loại database
 if DATABASE_URL.startswith("sqlite"):
     connect_args = {"check_same_thread": False}
-elif DATABASE_URL.startswith("mysql") or DATABASE_URL.startswith("mysql+pymysql"):
-    # Fix lỗi "Public Key Retrieval is not allowed" với MySQL 8.0+
-    connect_args = {"allowPublicKeyRetrieval": True}
-    # Nếu URL chưa có tham số, thêm vào URL
-    if "?" not in DATABASE_URL:
-        DATABASE_URL = f"{DATABASE_URL}?allowPublicKeyRetrieval=true"
 else:
+    # Với MySQL qua PyMySQL, tránh truyền tham số không hỗ trợ
     connect_args = {}
 
 engine = create_engine(DATABASE_URL, connect_args=connect_args)

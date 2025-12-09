@@ -479,15 +479,15 @@ def get_db_connection(db_id: int, current_user: models.User = Depends(get_curren
     if db_obj.status != "ACTIVE":
         raise HTTPException(status_code=400, detail="Database is not active")
     
-    hostname = db_obj.hostname or "localhost"
-    port = db_obj.port or 3306
+    hostname = os.getenv("PUBLIC_MYSQL_HOST") or db_obj.hostname or "localhost"
+    port = int(os.getenv("PUBLIC_MYSQL_PORT") or db_obj.port or 3306)
     # Lấy tên database thực tế (đã được sanitize khi tạo) hoặc fallback về db_{id}
     db_name = db_obj.physical_db_name or f"db_{db_obj.id}"
     username = db_obj.db_username or ""
     password = db_obj.db_password_hash or ""  # Trong production nên decrypt
     
     # Connection string với allowPublicKeyRetrieval=true để fix lỗi với MySQL 8.0+
-    connection_string = f"mysql://{username}:{password}@{hostname}:{port}/{db_name}?allowPublicKeyRetrieval=true"
+    connection_string = f"mysql://{username}:{password}@{hostname}:{port}/{db_name}?allowPublicKeyRetrieval=true&useSSL=false"
     
     # JDBC URL cho các tools như DBeaver, MySQL Workbench
     jdbc_url = f"jdbc:mysql://{hostname}:{port}/{db_name}?allowPublicKeyRetrieval=true&useSSL=false"

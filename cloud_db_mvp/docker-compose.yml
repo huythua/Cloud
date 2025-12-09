@@ -8,12 +8,65 @@ services:
       MYSQL_ROOT_PASSWORD: admin@123 # Sửa lại cho khớp với .env
       MYSQL_DATABASE: admin_db
     ports:
-      - "3306:3306"
+      - "3307:3306" # đổi host port tránh trùng 3306
     volumes:
       - mysql_data:/var/lib/mysql
     command: --default-authentication-plugin=mysql_native_password
+    networks:
+      - default
+      - nginx_default
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: cloud_db_backend
+    restart: unless-stopped
+    environment:
+      METADATA_DATABASE_URL: mysql+pymysql://root:admin%40123@mysql:3306/admin_db
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_ADMIN_USER: root
+      MYSQL_ADMIN_PASSWORD: admin@123
+      SECRET_KEY: change-me
+      FRONTEND_ORIGINS: https://cloud.tadalabs.vn
+      # Public MySQL host/port để client bên ngoài kết nối
+      # Thay YOUR_SERVER_IP bằng IP public hoặc domain MySQL của bạn
+      PUBLIC_MYSQL_HOST: ${PUBLIC_MYSQL_HOST:-103.179.173.220}
+      PUBLIC_MYSQL_PORT: ${PUBLIC_MYSQL_PORT:-3307}
+    ports:
+      - "8001:8000" # đổi host port tránh trùng 8000
+    depends_on:
+      - mysql
+    networks:
+      - default
+      - nginx_default
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # FE gọi qua domain BE (đã bỏ dấu gạch dưới)
+        VITE_API_URL: https://be-cloud.tadalabs.vn
+    container_name: cloud_db_frontend
+    restart: unless-stopped
+    ports:
+      - "4173:4173"
+    depends_on:
+      - backend
+    networks:
+      - default
+      - nginx_default
 volumes:
   mysql_data:
 # Ghi chú: Đổi MYSQL_ROOT_PASSWORD cho khớp với file .env bạn dùng!
 # Command trên sẽ set MySQL dùng mysql_native_password thay vì caching_sha2_password
 # để tránh lỗi "Public Key Retrieval is not allowed" với PyMySQL
+# 
+# Để set PUBLIC_MYSQL_HOST, tạo file .env hoặc export:
+# PUBLIC_MYSQL_HOST=your-server-ip-or-domain
+# PUBLIC_MYSQL_PORT=3307
+networks:
+  nginx_default:
+    external: true
