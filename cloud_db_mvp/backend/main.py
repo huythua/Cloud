@@ -6,8 +6,11 @@ main.py - Entry point for Cloud DB MVP backend
 """
 
 import os
-from fastapi import FastAPI, Depends, HTTPException, status, Query
+from pathlib import Path
+from datetime import datetime
+from fastapi import FastAPI, Depends, HTTPException, status, Query, Request, UploadFile, File, Body
 from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.responses import RedirectResponse, JSONResponse, FileResponse
 from sqlalchemy.orm import Session
 from database import Base, engine, get_db
 import models, schemas
@@ -15,6 +18,15 @@ from auth import get_password_hash, authenticate_user, create_access_token
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 import database as _database
+import httpx
+from urllib.parse import urlencode
+import vnpay
+from services.backup_service import BackupService
+from services.monitoring_service import MonitoringService
+from services.clone_service import CloneService
+from services.export_import_service import ExportImportService
+from services.sql_executor_service import SQLExecutorService
+from typing import Optional
 
 # Create all tables
 Base.metadata.create_all(bind=engine)
@@ -55,9 +67,49 @@ def _ensure_sqlite_columns():
             conn.execute(text("ALTER TABLE databases ADD COLUMN quota_status VARCHAR(20);"))
         except Exception:
             pass
+        # Add Google OAuth columns
+        try:
+            conn.execute(text("ALTER TABLE users ADD COLUMN google_id VARCHAR(255);"))
+        except Exception:
+            pass
+        try:
+            conn.execute(text("ALTER TABLE users MODIFY COLUMN hashed_password VARCHAR(255) NULL;"))
+        except Exception:
+            pass
+
+
+def _ensure_mysql_columns():
+    """If using MySQL, try to add missing columns to existing tables safely."""
+    db_url = getattr(_database, 'DATABASE_URL', '')
+    if not (db_url.startswith('mysql') or db_url.startswith('mysql+pymysql')):
+        return
+    # attempt to add columns if they don't exist
+    with engine.begin() as conn:
+        # Check and add google_id column
+        try:
+            # Check if column exists first
+            result = conn.execute(text("""
+                SELECT COUNT(*) FROM information_schema.COLUMNS 
+                WHERE TABLE_SCHEMA = DATABASE() 
+                AND TABLE_NAME = 'users' 
+                AND COLUMN_NAME = 'google_id'
+            """))
+            if result.scalar() == 0:
+                conn.execute(text("ALTER TABLE users ADD COLUMN google_id VARCHAR(255) NULL;"))
+                conn.execute(text("CREATE INDEX ix_users_google_id ON users(google_id);"))
+        except Exception as e:
+            print(f"Warning: Could not add google_id column: {e}")
+            pass
+        # Make hashed_password nullable
+        try:
+            conn.execute(text("ALTER TABLE users MODIFY COLUMN hashed_password VARCHAR(255) NULL;"))
+        except Exception as e:
+            print(f"Warning: Could not modify hashed_password: {e}")
+            pass
 
 
 _ensure_sqlite_columns()
+_ensure_mysql_columns()
 
 app = FastAPI(title="Cloud DB MVP Backend")
  
@@ -95,6 +147,130 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     access_token = create_access_token({"sub": str(user.id)})
     return {"access_token": access_token, "token_type": "bearer"}
+
+# --- Google OAuth APIs ---
+
+@app.get("/auth/google")
+def google_login():
+    """Trả về Google OAuth URL để redirect user"""
+    google_client_id = os.getenv("GOOGLE_CLIENT_ID")
+    if not google_client_id:
+        raise HTTPException(status_code=500, detail="Google OAuth not configured")
+    
+    # Get frontend URL and clean it
+    frontend_url = os.getenv("FRONTEND_ORIGINS", "http://localhost:5173").split(",")[0].strip()
+    # Remove trailing slash and any whitespace
+    frontend_url = frontend_url.rstrip('/').strip()
+    redirect_uri = f"{frontend_url}/auth/google/callback"
+    
+    # Ensure no whitespace in redirect_uri
+    redirect_uri = redirect_uri.replace(' ', '').replace('\n', '').replace('\t', '')
+    
+    # Log redirect URI for debugging
+    print(f"Google OAuth redirect_uri: {redirect_uri}")
+    print(f"Redirect URI length: {len(redirect_uri)}, has spaces: {' ' in redirect_uri}")
+    
+    # URL encode redirect_uri properly
+    from urllib.parse import urlencode
+    params = {
+        "client_id": google_client_id.strip(),
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "access_type": "offline"
+    }
+    google_auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
+    
+    return {"auth_url": google_auth_url}
+
+@app.post("/auth/google/callback")
+async def google_callback(request: schemas.GoogleCallbackRequest, db: Session = Depends(get_db)):
+    """Xử lý Google OAuth callback và tạo/login user"""
+    code = request.code
+    google_client_id = os.getenv("GOOGLE_CLIENT_ID")
+    google_client_secret = os.getenv("GOOGLE_CLIENT_SECRET")
+    
+    if not google_client_id or not google_client_secret:
+        raise HTTPException(status_code=500, detail="Google OAuth not configured")
+    
+    frontend_url = os.getenv("FRONTEND_ORIGINS", "http://localhost:5173").split(",")[0].strip()
+    # Remove trailing slash if exists
+    frontend_url = frontend_url.rstrip('/')
+    redirect_uri = f"{frontend_url}/auth/google/callback"
+    
+    # Log redirect URI for debugging
+    print(f"Google callback redirect_uri: {redirect_uri}")
+    print(f"Received code: {code[:20]}...")
+    
+    # Exchange code for access token
+    async with httpx.AsyncClient() as client:
+        token_response = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "code": code,
+                "client_id": google_client_id,
+                "client_secret": google_client_secret,
+                "redirect_uri": redirect_uri,
+                "grant_type": "authorization_code",
+            },
+        )
+        
+        if token_response.status_code != 200:
+            error_detail = token_response.text
+            print(f"Google token exchange error: {error_detail}")
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Failed to exchange code for token: {error_detail}"
+            )
+        
+        token_data = token_response.json()
+        access_token = token_data.get("access_token")
+        
+        if not access_token:
+            print(f"Google token response: {token_data}")
+            raise HTTPException(status_code=400, detail="No access token received")
+        
+        # Get user info from Google
+        user_info_response = await client.get(
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        
+        if user_info_response.status_code != 200:
+            raise HTTPException(status_code=400, detail="Failed to get user info")
+        
+        user_info = user_info_response.json()
+        google_id = user_info.get("id")
+        email = user_info.get("email")
+        name = user_info.get("name", "")
+        
+        if not google_id or not email:
+            raise HTTPException(status_code=400, detail="Invalid user info from Google")
+        
+        # Check if user exists by google_id or email
+        user = db.query(models.User).filter(
+            (models.User.google_id == google_id) | (models.User.email == email)
+        ).first()
+        
+        if user:
+            # Update google_id if missing
+            if not user.google_id:
+                user.google_id = google_id
+                db.commit()
+        else:
+            # Create new user
+            user = models.User(
+                email=email,
+                google_id=google_id,
+                hashed_password=None,  # No password for Google OAuth users
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+        
+        # Generate JWT token
+        access_token_jwt = create_access_token({"sub": str(user.id)})
+        return {"access_token": access_token_jwt, "token_type": "bearer"}
 
 # --- DATABASE CLOUD APIs ---
 from auth import get_current_user
@@ -219,6 +395,21 @@ def create_db(req: schemas.CreateDatabase, current_user: models.User = Depends(g
     plan = db.query(models.PricingPlan).filter(models.PricingPlan.id == active_sub.plan_id).first()
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
+
+    # Kiểm tra giới hạn số lượng database dựa trên users_allowed của gói
+    # Đếm các database còn tồn tại/đang dùng (không tính DELETED)
+    existing_db_count = db.query(models.Database).filter(
+        models.Database.owner_id == current_user.id,
+        models.Database.status.in_(["ACTIVE", "PENDING", "BLOCKED"])
+    ).count()
+    if existing_db_count >= plan.users_allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Vượt quá giới hạn số lượng database. Gói của bạn cho phép tạo {plan.users_allowed} database; "
+                f"hiện tại đã có {existing_db_count}. Vui lòng nâng cấp gói hoặc xóa bớt database."
+            )
+        )
     
     # Check tổng storage thực tế đã dùng (query từ MySQL) thay vì dùng quota_mb
     existing_dbs = db.query(models.Database).filter(
@@ -298,6 +489,17 @@ def create_db(req: schemas.CreateDatabase, current_user: models.User = Depends(g
     # Lưu password (trong production nên encrypt, MVP tạm lưu plaintext)
     db_obj.db_password_hash = req.db_password
     db.commit()
+    
+    # Tạo initial metrics để monitoring có data ngay
+    try:
+        from services.monitoring_service import MonitoringService
+        monitoring_service = MonitoringService()
+        # Collect initial metrics
+        monitoring_service.collect_metrics(db, db_obj.id)
+    except Exception as e:
+        # Không block nếu không tạo được metrics
+        print(f"Warning: Could not create initial metrics for database {db_obj.id}: {e}")
+    
     return db_obj
 
 @app.get("/db/list", response_model=list[schemas.DatabaseOut])
@@ -328,50 +530,41 @@ def update_db(db_id: int, update: schemas.UpdateDatabase, current_user: models.U
     return db_obj
 
 @app.get("/db/{db_id}/stats", response_model=schemas.DatabaseStats)
-def get_db_stats(db_id: int, test_mode: bool = Query(False, description="Chế độ test - dùng random data"), current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Lấy thống kê sử dụng database - query thực tế từ MySQL hoặc random data nếu test_mode"""
+def get_db_stats(db_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Lấy thống kê sử dụng database - query thực tế từ MySQL"""
     db_obj = db.query(models.Database).filter(models.Database.id == db_id, models.Database.owner_id == current_user.id).first()
     if not db_obj:
         raise HTTPException(status_code=404, detail="DB not found")
     
-    # Nếu test_mode, dùng random data
-    if test_mode:
-        import random
-        # Random used_mb từ 0 đến 200% của quota (nếu có) hoặc random 0-500 MB
-        if db_obj.quota_mb:
-            used_mb = round(random.uniform(0, db_obj.quota_mb * 2), 2)
-        else:
-            used_mb = round(random.uniform(0, 500), 2)
-    else:
-        # Query thực tế từ MySQL để lấy size database
-        used_mb = 0.0
-        if db_obj.status in ["ACTIVE", "BLOCKED"] and db_obj.physical_db_name:
-            try:
-                from services.mysql_service import MySQLService
-                mysql_service = MySQLService()
-                conn = mysql_service.connect()
-                cur = conn.cursor()
-                
-                # Query size của database (tính bằng MB)
-                db_name = db_obj.physical_db_name
-                cur.execute(f"""
-                    SELECT 
-                        ROUND(SUM(data_length + index_length) / 1024 / 1024, 2) AS size_mb
-                    FROM information_schema.tables 
-                    WHERE table_schema = '{db_name}'
-                """)
-                result = cur.fetchone()
-                if result and result[0] is not None:
-                    used_mb = float(result[0])
-                
-                conn.close()
-            except Exception as e:
-                # Nếu không query được, trả về 0 (database mới tạo chưa có data)
-                print(f"Warning: Could not query database size for {db_name}: {e}")
-                used_mb = 0.0
+    # Query thực tế từ MySQL để lấy size database (production only)
+    used_mb = 0.0
+    if db_obj.status in ["ACTIVE", "BLOCKED"] and db_obj.physical_db_name:
+        try:
+            from services.mysql_service import MySQLService
+            mysql_service = MySQLService()
+            conn = mysql_service.connect()
+            cur = conn.cursor()
+            
+            # Query size của database (tính bằng MB)
+            db_name = db_obj.physical_db_name
+            cur.execute(f"""
+                SELECT 
+                    ROUND(SUM(data_length + index_length) / 1024 / 1024, 2) AS size_mb
+                FROM information_schema.tables 
+                WHERE table_schema = '{db_name}'
+            """)
+            result = cur.fetchone()
+            if result and result[0] is not None:
+                used_mb = float(result[0])
+            
+            conn.close()
+        except Exception as e:
+            # Nếu không query được, trả về 0 (database mới tạo chưa có data)
+            print(f"Warning: Could not query database size for {db_name}: {e}")
+            used_mb = 0.0
     
-    # Check và update quota status (sẽ dùng test_mode nếu cần)
-    quota_info = check_and_update_quota_status(current_user.id, db, test_mode=test_mode)
+    # Check và update quota status
+    quota_info = check_and_update_quota_status(current_user.id, db)
     db.refresh(db_obj)
     
     return {
@@ -384,7 +577,7 @@ def get_db_stats(db_id: int, test_mode: bool = Query(False, description="Chế �
         "created_at": db_obj.created_at.isoformat() if db_obj.created_at else None
     }
 
-def check_and_update_quota_status(user_id: int, db: Session, test_mode: bool = False):
+def check_and_update_quota_status(user_id: int, db: Session):
     """Check tổng storage và update quota_status cho tất cả databases của user"""
     # Lấy active subscription
     active_sub = db.query(models.Subscription).filter(
@@ -406,41 +599,30 @@ def check_and_update_quota_status(user_id: int, db: Session, test_mode: bool = F
     
     total_used_storage_mb = 0.0
     
-    if test_mode:
-        # Random data cho test mode
-        import random
+    # Query thực tế từ MySQL (production only)
+    try:
+        from services.mysql_service import MySQLService
+        mysql_service = MySQLService()
+        conn = mysql_service.connect()
+        cur = conn.cursor()
+        
         for db_obj in existing_dbs:
-            if db_obj.quota_mb:
-                # Random từ 0 đến 200% của quota
-                total_used_storage_mb += round(random.uniform(0, db_obj.quota_mb * 2), 2)
-            else:
-                # Random 0-500 MB nếu không có quota
-                total_used_storage_mb += round(random.uniform(0, 500), 2)
-    else:
-        # Query thực tế từ MySQL
-        try:
-            from services.mysql_service import MySQLService
-            mysql_service = MySQLService()
-            conn = mysql_service.connect()
-            cur = conn.cursor()
-            
-            for db_obj in existing_dbs:
-                if db_obj.physical_db_name:
-                    try:
-                        cur.execute(f"""
-                            SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024, 2) AS size_mb
-                            FROM information_schema.tables 
-                            WHERE table_schema = '{db_obj.physical_db_name}'
-                        """)
-                        result = cur.fetchone()
-                        if result and result[0] is not None:
-                            total_used_storage_mb += float(result[0])
-                    except Exception:
-                        pass
-            
-            conn.close()
-        except Exception:
-            total_used_storage_mb = 0.0
+            if db_obj.physical_db_name:
+                try:
+                    cur.execute(f"""
+                        SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024, 2) AS size_mb
+                        FROM information_schema.tables 
+                        WHERE table_schema = '{db_obj.physical_db_name}'
+                    """)
+                    result = cur.fetchone()
+                    if result and result[0] is not None:
+                        total_used_storage_mb += float(result[0])
+                except Exception:
+                    pass
+        
+        conn.close()
+    except Exception:
+        total_used_storage_mb = 0.0
     
     # Tính phần trăm đã dùng
     used_percent = (total_used_storage_mb / plan.storage_mb * 100) if plan.storage_mb > 0 else 0
@@ -552,490 +734,676 @@ def delete_db(db_id: int, current_user: models.User = Depends(get_current_user),
     db.commit()
     return {"ok": True}
 
+# --- BACKUP & RESTORE APIs ---
+
+@app.post("/db/{db_id}/backup", response_model=schemas.BackupOut)
+def create_backup(
+    db_id: int,
+    req: schemas.CreateBackupRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Tạo backup cho database"""
+    # Kiểm tra database thuộc về user
+    db_obj = db.query(models.Database).filter(
+        models.Database.id == db_id,
+        models.Database.owner_id == current_user.id
+    ).first()
+    if not db_obj:
+        raise HTTPException(status_code=404, detail="Database not found")
+    
+    backup_service = BackupService()
+    try:
+        backup = backup_service.create_backup(
+            db=db,
+            database_id=db_id,
+            name=req.name,
+            description=req.description
+        )
+        # Refresh để lấy status mới nhất
+        db.refresh(backup)
+        return backup
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback
+        error_detail = str(e)
+        error_trace = traceback.format_exc()
+        print(f"Backup API error: {error_detail}")
+        print(f"Traceback: {error_trace}")
+        raise HTTPException(status_code=500, detail=f"Backup failed: {error_detail}")
+
+@app.get("/db/{db_id}/backups", response_model=list[schemas.BackupOut])
+def list_backups(
+    db_id: int,
+    status: Optional[str] = Query(None, description="Filter by status: PENDING, IN_PROGRESS, COMPLETED, FAILED"),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Lấy danh sách backups của database"""
+    # Kiểm tra database thuộc về user
+    db_obj = db.query(models.Database).filter(
+        models.Database.id == db_id,
+        models.Database.owner_id == current_user.id
+    ).first()
+    if not db_obj:
+        raise HTTPException(status_code=404, detail="Database not found")
+    
+    backup_service = BackupService()
+    backups = backup_service.list_backups(db=db, database_id=db_id, status=status)
+    return backups
+
+@app.get("/db/{db_id}/backups/{backup_id}", response_model=schemas.BackupOut)
+def get_backup(
+    db_id: int,
+    backup_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Lấy thông tin backup"""
+    backup = db.query(models.Backup).filter(
+        models.Backup.id == backup_id,
+        models.Backup.database_id == db_id
+    ).first()
+    if not backup:
+        raise HTTPException(status_code=404, detail="Backup not found")
+    
+    # Kiểm tra database thuộc về user
+    db_obj = db.query(models.Database).filter(
+        models.Database.id == db_id,
+        models.Database.owner_id == current_user.id
+    ).first()
+    if not db_obj:
+        raise HTTPException(status_code=404, detail="Database not found")
+    
+    return backup
+
+@app.delete("/db/{db_id}/backups/{backup_id}")
+def delete_backup(
+    db_id: int,
+    backup_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Xóa backup"""
+    backup = db.query(models.Backup).filter(
+        models.Backup.id == backup_id,
+        models.Backup.database_id == db_id
+    ).first()
+    if not backup:
+        raise HTTPException(status_code=404, detail="Backup not found")
+    
+    # Kiểm tra database thuộc về user
+    db_obj = db.query(models.Database).filter(
+        models.Database.id == db_id,
+        models.Database.owner_id == current_user.id
+    ).first()
+    if not db_obj:
+        raise HTTPException(status_code=404, detail="Database not found")
+    
+    backup_service = BackupService()
+    backup_service.delete_backup(db=db, backup_id=backup_id)
+    return {"ok": True}
+
+@app.get("/db/{db_id}/backups/{backup_id}/download")
+def download_backup(
+    db_id: int,
+    backup_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Download backup file"""
+    backup = db.query(models.Backup).filter(
+        models.Backup.id == backup_id,
+        models.Backup.database_id == db_id
+    ).first()
+    if not backup:
+        raise HTTPException(status_code=404, detail="Backup not found")
+    
+    # Kiểm tra database thuộc về user
+    db_obj = db.query(models.Database).filter(
+        models.Database.id == db_id,
+        models.Database.owner_id == current_user.id
+    ).first()
+    if not db_obj:
+        raise HTTPException(status_code=404, detail="Database not found")
+    
+    if backup.status != "COMPLETED":
+        raise HTTPException(status_code=400, detail="Backup is not completed")
+    
+    if not os.path.exists(backup.file_path):
+        raise HTTPException(status_code=404, detail="Backup file not found")
+    
+    return FileResponse(
+        path=backup.file_path,
+        filename=os.path.basename(backup.file_path),
+        media_type="application/sql"
+    )
+
+@app.post("/db/{db_id}/restore", response_model=schemas.RestoreOut)
+def restore_backup(
+    db_id: int,
+    req: schemas.RestoreRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Restore database từ backup"""
+    # Kiểm tra database thuộc về user
+    db_obj = db.query(models.Database).filter(
+        models.Database.id == db_id,
+        models.Database.owner_id == current_user.id
+    ).first()
+    if not db_obj:
+        raise HTTPException(status_code=404, detail="Database not found")
+    
+    backup_service = BackupService()
+    try:
+        restore = backup_service.restore_backup(
+            db=db,
+            database_id=db_id,
+            backup_id=req.backup_id
+        )
+        return restore
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Restore failed: {str(e)}")
+
+@app.get("/db/{db_id}/restores/{restore_id}", response_model=schemas.RestoreOut)
+def get_restore_status(
+    db_id: int,
+    restore_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Lấy trạng thái restore operation"""
+    restore = db.query(models.Restore).filter(
+        models.Restore.id == restore_id,
+        models.Restore.database_id == db_id
+    ).first()
+    if not restore:
+        raise HTTPException(status_code=404, detail="Restore operation not found")
+    
+    # Kiểm tra database thuộc về user
+    db_obj = db.query(models.Database).filter(
+        models.Database.id == db_id,
+        models.Database.owner_id == current_user.id
+    ).first()
+    if not db_obj:
+        raise HTTPException(status_code=404, detail="Database not found")
+    
+    return restore
+
+@app.get("/db/{db_id}/restores", response_model=list[schemas.RestoreOut])
+def list_restores(
+    db_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Lấy danh sách restore operations của database"""
+    # Kiểm tra database thuộc về user
+    db_obj = db.query(models.Database).filter(
+        models.Database.id == db_id,
+        models.Database.owner_id == current_user.id
+    ).first()
+    if not db_obj:
+        raise HTTPException(status_code=404, detail="Database not found")
+    
+    restores = db.query(models.Restore).filter(
+        models.Restore.database_id == db_id
+    ).order_by(models.Restore.created_at.desc()).all()
+    return restores
+
+# --- DATABASE CLONING APIs ---
+
+@app.post("/db/{db_id}/clone", response_model=schemas.CloneOut)
+def clone_database(
+    db_id: int,
+    req: schemas.CloneRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Clone database"""
+    # Kiểm tra database thuộc về user
+    source_db = db.query(models.Database).filter(
+        models.Database.id == db_id,
+        models.Database.owner_id == current_user.id
+    ).first()
+    if not source_db:
+        raise HTTPException(status_code=404, detail="Database not found")
+    
+    if source_db.status != "ACTIVE":
+        raise HTTPException(status_code=400, detail="Source database must be ACTIVE")
+    
+    # Kiểm tra subscription active và giới hạn số lượng DB (giống tạo DB mới)
+    active_sub = db.query(models.Subscription).filter(
+        models.Subscription.user_id == current_user.id,
+        models.Subscription.status == "ACTIVE"
+    ).first()
+    if not active_sub:
+        raise HTTPException(
+            status_code=400, 
+            detail="Bạn cần có gói dịch vụ đang hoạt động để clone database. Vui lòng đăng ký gói trước."
+        )
+    
+    plan = db.query(models.PricingPlan).filter(models.PricingPlan.id == active_sub.plan_id).first()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Không tìm thấy gói dịch vụ")
+    
+    # Kiểm tra giới hạn số lượng database (clone sẽ tạo DB mới)
+    existing_db_count = db.query(models.Database).filter(
+        models.Database.owner_id == current_user.id,
+        models.Database.status.in_(["ACTIVE", "PENDING", "BLOCKED"])
+    ).count()
+    if existing_db_count >= plan.users_allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Không thể clone: vượt quá giới hạn số lượng database. Gói của bạn cho phép {plan.users_allowed} database; "
+                f"hiện tại đã có {existing_db_count}. Vui lòng nâng cấp gói hoặc xóa bớt database."
+            )
+        )
+    
+    clone_service = CloneService()
+    try:
+        clone_op = clone_service.clone_database(
+            db=db,
+            source_database_id=db_id,
+            name=req.name,
+            description=req.description,
+            owner_id=current_user.id
+        )
+        return clone_op
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Clone failed: {str(e)}")
+
+@app.get("/db/{db_id}/clones", response_model=list[schemas.CloneOut])
+def list_clones(
+    db_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Lấy danh sách clone operations của database"""
+    # Kiểm tra database thuộc về user
+    db_obj = db.query(models.Database).filter(
+        models.Database.id == db_id,
+        models.Database.owner_id == current_user.id
+    ).first()
+    if not db_obj:
+        raise HTTPException(status_code=404, detail="Database not found")
+    
+    clone_service = CloneService()
+    clones = clone_service.list_clones(db=db, database_id=db_id)
+    return clones
+
+@app.get("/clones/{clone_id}", response_model=schemas.CloneOut)
+def get_clone_status(
+    clone_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Lấy trạng thái clone operation"""
+    clone_op = db.query(models.DatabaseClone).filter(models.DatabaseClone.id == clone_id).first()
+    if not clone_op:
+        raise HTTPException(status_code=404, detail="Clone operation not found")
+    
+    # Kiểm tra user có quyền xem clone này không
+    source_db = db.query(models.Database).filter(models.Database.id == clone_op.source_database_id).first()
+    if source_db.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    return clone_op
+
+# --- DATABASE EXPORT/IMPORT APIs ---
+
+@app.get("/db/{db_id}/export")
+def export_database(
+    db_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Export database thành SQL dump file"""
+    # Kiểm tra database thuộc về user
+    db_obj = db.query(models.Database).filter(
+        models.Database.id == db_id,
+        models.Database.owner_id == current_user.id
+    ).first()
+    if not db_obj:
+        raise HTTPException(status_code=404, detail="Database not found")
+    
+    export_service = ExportImportService()
+    try:
+        file_path = export_service.export_database(db=db, database_id=db_id)
+        
+        # Return file as download
+        return FileResponse(
+            path=str(file_path),
+            filename=file_path.name,
+            media_type="application/sql"
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
+
+@app.post("/db/{db_id}/import", response_model=schemas.ImportOut)
+def import_database(
+    db_id: int,
+    file: UploadFile = File(...),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Import SQL dump vào database"""
+    # Kiểm tra database thuộc về user
+    db_obj = db.query(models.Database).filter(
+        models.Database.id == db_id,
+        models.Database.owner_id == current_user.id
+    ).first()
+    if not db_obj:
+        raise HTTPException(status_code=404, detail="Database not found")
+    
+    if not file.filename.endswith('.sql'):
+        raise HTTPException(status_code=400, detail="File must be a .sql file")
+    
+    export_service = ExportImportService()
+    
+    # Lưu file tạm thời
+    import_dir = Path(os.getenv("EXPORT_DIR", "/exports"))
+    import_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    temp_filename = f"import_{db_id}_{timestamp}_{file.filename}"
+    temp_file_path = import_dir / temp_filename
+    
+    try:
+        # Lưu uploaded file
+        file_size = 0
+        with open(temp_file_path, 'wb') as f:
+            content = file.file.read()
+            f.write(content)
+            file_size = len(content) / (1024 * 1024)  # MB
+        
+        # Import database
+        import_op = export_service.import_database(
+            db=db,
+            database_id=db_id,
+            file_path=str(temp_file_path),
+            file_name=file.filename,
+            file_size_mb=round(file_size, 2)
+        )
+        
+        return import_op
+        
+    except ValueError as e:
+        # Xóa file tạm nếu có lỗi
+        if temp_file_path.exists():
+            temp_file_path.unlink()
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        # Xóa file tạm nếu có lỗi
+        if temp_file_path.exists():
+            temp_file_path.unlink()
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Import failed: {str(e)}")
+
+@app.get("/db/{db_id}/imports", response_model=list[schemas.ImportOut])
+def list_imports(
+    db_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Lấy danh sách import operations của database"""
+    # Kiểm tra database thuộc về user
+    db_obj = db.query(models.Database).filter(
+        models.Database.id == db_id,
+        models.Database.owner_id == current_user.id
+    ).first()
+    if not db_obj:
+        raise HTTPException(status_code=404, detail="Database not found")
+    
+    export_service = ExportImportService()
+    imports = export_service.list_imports(db=db, database_id=db_id)
+    return imports
+
+@app.get("/imports/{import_id}", response_model=schemas.ImportOut)
+def get_import_status(
+    import_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Lấy trạng thái import operation"""
+    import_op = db.query(models.DatabaseImport).filter(models.DatabaseImport.id == import_id).first()
+    if not import_op:
+        raise HTTPException(status_code=404, detail="Import operation not found")
+    
+    # Kiểm tra user có quyền xem import này không
+    db_obj = db.query(models.Database).filter(models.Database.id == import_op.database_id).first()
+    if db_obj.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    
+    return import_op
+
+# --- MONITORING APIs ---
+
+@app.get("/db/{db_id}/metrics", response_model=schemas.MetricsResponse)
+def get_metrics(
+    db_id: int,
+    timeframe: str = Query("1h", description="Timeframe: 1h, 6h, 24h, 7d"),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Lấy metrics của database"""
+    # Kiểm tra database thuộc về user
+    db_obj = db.query(models.Database).filter(
+        models.Database.id == db_id,
+        models.Database.owner_id == current_user.id
+    ).first()
+    if not db_obj:
+        raise HTTPException(status_code=404, detail="Database not found")
+    
+    monitoring_service = MonitoringService()
+    try:
+        # Collect metrics trước khi lấy (để đảm bảo có data mới nhất)
+        try:
+            monitoring_service.collect_metrics(db, db_id)
+        except Exception as e:
+            # Không block nếu không collect được metrics
+            print(f"Warning: Could not collect metrics: {e}")
+        
+        metrics = monitoring_service.get_metrics(db=db, database_id=db_id, timeframe=timeframe)
+        return metrics
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get metrics: {str(e)}")
+
+@app.get("/db/{db_id}/metrics/realtime", response_model=schemas.MetricsResponse)
+def get_real_time_metrics(
+    db_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Lấy real-time metrics của database"""
+    # Kiểm tra database thuộc về user
+    db_obj = db.query(models.Database).filter(
+        models.Database.id == db_id,
+        models.Database.owner_id == current_user.id
+    ).first()
+    if not db_obj:
+        raise HTTPException(status_code=404, detail="Database not found")
+    
+    monitoring_service = MonitoringService()
+    metrics = monitoring_service.get_real_time_metrics(db=db, database_id=db_id)
+    return metrics
+
+@app.get("/db/{db_id}/connections", response_model=schemas.ConnectionsResponse)
+def get_connections(
+    db_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Lấy danh sách connections của database"""
+    # Kiểm tra database thuộc về user
+    db_obj = db.query(models.Database).filter(
+        models.Database.id == db_id,
+        models.Database.owner_id == current_user.id
+    ).first()
+    if not db_obj:
+        raise HTTPException(status_code=404, detail="Database not found")
+    
+    monitoring_service = MonitoringService()
+    try:
+        connections = monitoring_service.get_connections(db=db, database_id=db_id)
+        return connections
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get connections: {str(e)}")
+
+@app.get("/db/{db_id}/slow-queries", response_model=list[schemas.SlowQueryOut])
+def get_slow_queries(
+    db_id: int,
+    limit: int = Query(50, description="Limit số lượng queries"),
+    min_duration_ms: float = Query(1000.0, description="Minimum duration in milliseconds"),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Lấy danh sách slow queries"""
+    # Kiểm tra database thuộc về user
+    db_obj = db.query(models.Database).filter(
+        models.Database.id == db_id,
+        models.Database.owner_id == current_user.id
+    ).first()
+    if not db_obj:
+        raise HTTPException(status_code=404, detail="Database not found")
+    
+    monitoring_service = MonitoringService()
+    slow_queries = monitoring_service.get_slow_queries(
+        db=db,
+        database_id=db_id,
+        limit=limit,
+        min_duration_ms=min_duration_ms
+    )
+    return slow_queries
+
+@app.get("/db/{db_id}/performance", response_model=schemas.PerformanceSummary)
+def get_performance_summary(
+    db_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Lấy performance summary của database"""
+    # Kiểm tra database thuộc về user
+    db_obj = db.query(models.Database).filter(
+        models.Database.id == db_id,
+        models.Database.owner_id == current_user.id
+    ).first()
+    if not db_obj:
+        raise HTTPException(status_code=404, detail="Database not found")
+    
+    monitoring_service = MonitoringService()
+    summary = monitoring_service.get_performance_summary(db=db, database_id=db_id)
+    return summary
+
+# --- SQL QUERY EXECUTION APIs ---
+
+@app.post("/db/{db_id}/query", response_model=schemas.SQLQueryResponse)
+def execute_sql_query(
+    db_id: int,
+    req: schemas.SQLQueryRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Execute SQL query trên database"""
+    # Kiểm tra database thuộc về user
+    db_obj = db.query(models.Database).filter(
+        models.Database.id == db_id,
+        models.Database.owner_id == current_user.id
+    ).first()
+    if not db_obj:
+        raise HTTPException(status_code=404, detail="Database not found")
+    
+    if db_obj.status != "ACTIVE":
+        raise HTTPException(status_code=400, detail="Database must be ACTIVE")
+    
+    sql_executor = SQLExecutorService()
+    try:
+        result = sql_executor.execute_query(
+            db=db,
+            database_id=db_id,
+            query=req.query,
+            user_id=current_user.id
+        )
+        
+        # Collect metrics sau khi execute query (để monitoring có data)
+        try:
+            monitoring_service = MonitoringService()
+            monitoring_service.collect_metrics(db, db_id)
+        except Exception as e:
+            # Không block nếu không collect được metrics
+            print(f"Warning: Could not collect metrics after query execution: {e}")
+        
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Query execution failed: {str(e)}")
+
 # --- SUBSCRIPTION APIs ---
 
-@app.post("/subscriptions", response_model=schemas.SubscriptionOut)
-def subscribe_plan(req: schemas.SubscribePlan, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Đăng ký gói dịch vụ - yêu cầu có đủ số dư"""
-    # Kiểm tra plan có tồn tại không
-    plan = db.query(models.PricingPlan).filter(models.PricingPlan.id == req.plan_id).first()
-    if not plan:
-        raise HTTPException(status_code=404, detail="Plan not found")
-    
-    # Kiểm tra user đã có subscription active chưa
-    active_sub = db.query(models.Subscription).filter(
-        models.Subscription.user_id == current_user.id,
-        models.Subscription.status == "ACTIVE"
-    ).first()
-    if active_sub:
-        raise HTTPException(status_code=400, detail="User already has an active subscription")
-    
-    # Kiểm tra số dư có đủ để thanh toán gói không
-    if plan.price_monthly_cents > 0 and current_user.balance_cents < plan.price_monthly_cents:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Insufficient balance. Required: {plan.price_monthly_cents}₫, Current: {current_user.balance_cents}₫"
-        )
-    
-    # Merge user vào session để đảm bảo changes được track
-    user_in_session = db.merge(current_user)
-    
-    # Trừ tiền nếu gói có phí
-    if plan.price_monthly_cents > 0:
-        user_in_session.balance_cents -= plan.price_monthly_cents
-    
-    # Tạo subscription mới
-    from datetime import datetime, timedelta
-    subscription = models.Subscription(
-        user_id=current_user.id,
-        plan_id=req.plan_id,
-        status="ACTIVE",
-        started_at=datetime.utcnow(),
-        auto_renew=1 if req.auto_renew else 0,
-        expires_at=datetime.utcnow() + timedelta(days=30)  # 30 ngày
-    )
-    db.add(subscription)
-    
-    # Tạo payment record cho subscription
-    payment = models.Payment(
-        user_id=current_user.id,
-        subscription_id=None,  # Sẽ set sau khi subscription được tạo
-        amount_cents=plan.price_monthly_cents,
-        currency=plan.currency,
-        status="COMPLETED",
-        payment_method="BALANCE",
-        description=f"Thanh toán gói {plan.name}",
-        completed_at=datetime.utcnow()
-    )
-    db.add(payment)
-    db.commit()
-    db.refresh(subscription)
-    db.refresh(user_in_session)  # Refresh user để đảm bảo balance được cập nhật
-    
-    # Cập nhật payment với subscription_id
-    payment.subscription_id = subscription.id
-    db.commit()
-    db.refresh(user_in_session)  # Refresh user để đảm bảo balance được cập nhật
-    
-    # Convert datetime to string for response
-    return {
-        "id": subscription.id,
-        "user_id": subscription.user_id,
-        "plan_id": subscription.plan_id,
-        "status": subscription.status,
-        "started_at": subscription.started_at.isoformat() if subscription.started_at else None,
-        "expires_at": subscription.expires_at.isoformat() if subscription.expires_at else None,
-        "auto_renew": subscription.auto_renew,
-        "created_at": subscription.created_at.isoformat() if subscription.created_at else None
-    }
-
-@app.get("/subscriptions", response_model=list[schemas.SubscriptionOut])
-def list_subscriptions(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Danh sách subscriptions của user"""
-    items = db.query(models.Subscription).filter(
-        models.Subscription.user_id == current_user.id
-    ).order_by(models.Subscription.created_at.desc()).all()
-    
-    # Convert datetime to string for response
-    return [
-        {
-            "id": item.id,
-            "user_id": item.user_id,
-            "plan_id": item.plan_id,
-            "status": item.status,
-            "started_at": item.started_at.isoformat() if item.started_at else None,
-            "expires_at": item.expires_at.isoformat() if item.expires_at else None,
-            "auto_renew": item.auto_renew,
-            "created_at": item.created_at.isoformat() if item.created_at else None
-        }
-        for item in items
-    ]
-
-@app.get("/subscriptions/active", response_model=schemas.SubscriptionOut)
-def get_active_subscription(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Lấy subscription đang active"""
-    sub = db.query(models.Subscription).filter(
-        models.Subscription.user_id == current_user.id,
-        models.Subscription.status == "ACTIVE"
-    ).first()
-    if not sub:
-        raise HTTPException(status_code=404, detail="No active subscription")
-    
-    # Convert datetime to string for response
-    return {
-        "id": sub.id,
-        "user_id": sub.user_id,
-        "plan_id": sub.plan_id,
-        "status": sub.status,
-        "started_at": sub.started_at.isoformat() if sub.started_at else None,
-        "expires_at": sub.expires_at.isoformat() if sub.expires_at else None,
-        "auto_renew": sub.auto_renew,
-        "created_at": sub.created_at.isoformat() if sub.created_at else None
-    }
-
-@app.post("/subscriptions/{sub_id}/cancel")
-def cancel_subscription(sub_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Hủy subscription - Lưu ý: Không hoàn tiền"""
-    sub = db.query(models.Subscription).filter(
-        models.Subscription.id == sub_id,
-        models.Subscription.user_id == current_user.id
-    ).first()
-    if not sub:
-        raise HTTPException(status_code=404, detail="Subscription not found")
-    if sub.status != "ACTIVE":
-        raise HTTPException(status_code=400, detail="Only active subscriptions can be cancelled")
-    sub.status = "CANCELLED"
-    sub.auto_renew = 0
-    db.commit()
-    return {"message": "Subscription cancelled successfully. Note: No refund will be issued."}
-
-@app.put("/subscriptions/{sub_id}/auto-renew")
-def toggle_auto_renew(sub_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Toggle auto-renew cho subscription"""
-    sub = db.query(models.Subscription).filter(
-        models.Subscription.id == sub_id,
-        models.Subscription.user_id == current_user.id
-    ).first()
-    if not sub:
-        raise HTTPException(status_code=404, detail="Subscription not found")
-    sub.auto_renew = 1 if sub.auto_renew == 0 else 0
-    db.commit()
-    return {
-        "message": f"Auto-renew {'enabled' if sub.auto_renew == 1 else 'disabled'}",
-        "auto_renew": sub.auto_renew == 1
-    }
-
-# --- PAYMENT APIs ---
-
-@app.post("/payments", response_model=schemas.PaymentOut)
-def create_payment(req: schemas.CreatePayment, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Tạo thanh toán ảo - tự động confirm ngay (mock payment)"""
-    from datetime import datetime
-    
-    # Tạo payment và tự động confirm (nạp tiền ảo)
-    payment = models.Payment(
-        user_id=current_user.id,
-        subscription_id=req.subscription_id,
-        amount_cents=req.amount_cents,
-        currency=req.currency,
-        status="COMPLETED",  # Tự động complete cho nạp tiền ảo
-        payment_method=req.payment_method or "VIRTUAL",
-        description=req.description or "Nạp tiền ảo",
-        completed_at=datetime.utcnow()
-    )
-    db.add(payment)
-    
-    # Merge user vào session hiện tại để đảm bảo changes được track
-    user_in_session = db.merge(current_user)
-    
-    # Cập nhật balance của user ngay lập tức
-    user_in_session.balance_cents += req.amount_cents
-    
-    # Cộng điểm tích lũy: 1 điểm = 100₫ (hệ số 1/100)
-    points_earned = req.amount_cents // 100
-    user_in_session.points += points_earned
-    
-    # Nếu thanh toán cho subscription, cập nhật subscription
-    if req.subscription_id:
-        sub = db.query(models.Subscription).filter(models.Subscription.id == req.subscription_id).first()
-        if sub:
-            sub.status = "ACTIVE"
-            from datetime import timedelta
-            if not sub.expires_at or sub.expires_at < datetime.utcnow():
-                sub.expires_at = datetime.utcnow() + timedelta(days=30)
-    
-    db.commit()
-    db.refresh(payment)
-    
-    # Refresh user để lấy giá trị mới nhất sau khi commit
-    db.refresh(user_in_session)
-    
-    # Convert datetime to string for response
-    response = {
-        "id": payment.id,
-        "user_id": payment.user_id,
-        "subscription_id": payment.subscription_id,
-        "amount_cents": payment.amount_cents,
-        "currency": payment.currency,
-        "status": payment.status,
-        "payment_method": payment.payment_method,
-        "transaction_id": payment.transaction_id,
-        "description": payment.description,
-        "created_at": payment.created_at.isoformat() if payment.created_at else None,
-        "completed_at": payment.completed_at.isoformat() if payment.completed_at else None,
-    }
-    return response
-
-
-@app.post("/points/convert", response_model=schemas.ConvertPointsResponse)
-def convert_points(req: schemas.ConvertPointsRequest, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """
-    Đổi điểm tích lũy sang tiền trong tài khoản.
-    Tỉ lệ hiện tại: 1 điểm = 10 VND (đổi nhẹ, không hoàn toàn nghịch với lúc tích điểm để dễ test).
-    """
-    if req.points <= 0:
-        raise HTTPException(status_code=400, detail="Số điểm đổi phải lớn hơn 0")
-
-    user_in_session = db.merge(current_user)
-
-    if req.points > user_in_session.points:
-        raise HTTPException(status_code=400, detail="Không đủ điểm để đổi")
-
-    # 1 điểm = 10 VND
-    amount_cents = req.points * 10
-    user_in_session.points -= req.points
-    user_in_session.balance_cents += amount_cents
-
-    db.commit()
-    db.refresh(user_in_session)
-
-    return schemas.ConvertPointsResponse(
-        converted_points=req.points,
-        amount_cents=amount_cents,
-        new_balance_cents=user_in_session.balance_cents,
-        new_points=user_in_session.points,
-    )
-
-@app.post("/payments/{payment_id}/confirm")
-def confirm_payment(payment_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Xác nhận thanh toán thành công (mock - trong thực tế sẽ verify từ payment gateway)"""
-    payment = db.query(models.Payment).filter(
-        models.Payment.id == payment_id,
-        models.Payment.user_id == current_user.id
-    ).first()
-    if not payment:
-        raise HTTPException(status_code=404, detail="Payment not found")
-    if payment.status != "PENDING":
-        raise HTTPException(status_code=400, detail="Payment already processed")
-    
-    # Cập nhật trạng thái thanh toán
-    payment.status = "COMPLETED"
-    from datetime import datetime
-    payment.completed_at = datetime.utcnow()
-    
-    # Merge user vào session hiện tại để đảm bảo changes được track
-    user_in_session = db.merge(current_user)
-    
-    # Cập nhật balance của user
-    user_in_session.balance_cents += payment.amount_cents
-    
-    # Cộng điểm tích lũy: 1 điểm = 100₫ (hệ số 1/100)
-    points_earned = payment.amount_cents // 100
-    user_in_session.points += points_earned
-    
-    # Nếu thanh toán cho subscription, cập nhật subscription
-    if payment.subscription_id:
-        sub = db.query(models.Subscription).filter(models.Subscription.id == payment.subscription_id).first()
-        if sub:
-            sub.status = "ACTIVE"
-            from datetime import timedelta
-            if not sub.expires_at or sub.expires_at < datetime.utcnow():
-                sub.expires_at = datetime.utcnow() + timedelta(days=30)
-    
-    db.commit()
-    db.refresh(payment)
-    db.refresh(user_in_session)
-    
-    # Convert datetime to string for response
-    payment_dict = {
-        "id": payment.id,
-        "user_id": payment.user_id,
-        "subscription_id": payment.subscription_id,
-        "amount_cents": payment.amount_cents,
-        "currency": payment.currency,
-        "status": payment.status,
-        "payment_method": payment.payment_method,
-        "transaction_id": payment.transaction_id,
-        "description": payment.description,
-        "created_at": payment.created_at.isoformat() if payment.created_at else None,
-        "completed_at": payment.completed_at.isoformat() if payment.completed_at else None,
-        "points_earned": points_earned,  # Điểm tích lũy đã nhận
-        "new_balance": user_in_session.balance_cents,  # Số dư mới
-        "new_points": user_in_session.points  # Điểm tích lũy mới
-    }
-    return {"message": "Payment confirmed successfully", "payment": payment_dict}
-
-@app.get("/payments", response_model=list[schemas.PaymentOut])
-def payment_history(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Lịch sử thanh toán của user"""
-    items = db.query(models.Payment).filter(
-        models.Payment.user_id == current_user.id
-    ).order_by(models.Payment.created_at.desc()).all()
-    
-    # Convert datetime to string for response
-    return [
-        {
-            "id": item.id,
-            "user_id": item.user_id,
-            "subscription_id": item.subscription_id,
-            "amount_cents": item.amount_cents,
-            "currency": item.currency,
-            "status": item.status,
-            "payment_method": item.payment_method,
-            "transaction_id": item.transaction_id,
-            "description": item.description,
-            "created_at": item.created_at.isoformat() if item.created_at else None,
-            "completed_at": item.completed_at.isoformat() if item.completed_at else None
-        }
-        for item in items
-    ]
-
-@app.get("/payments/{payment_id}", response_model=schemas.PaymentOut)
-def get_payment(payment_id: int, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Lấy thông tin chi tiết một payment"""
-    payment = db.query(models.Payment).filter(
-        models.Payment.id == payment_id,
-        models.Payment.user_id == current_user.id
-    ).first()
-    if not payment:
-        raise HTTPException(status_code=404, detail="Payment not found")
-    
-    # Convert datetime to string for response
-    return {
-        "id": payment.id,
-        "user_id": payment.user_id,
-        "subscription_id": payment.subscription_id,
-        "amount_cents": payment.amount_cents,
-        "currency": payment.currency,
-        "status": payment.status,
-        "payment_method": payment.payment_method,
-        "transaction_id": payment.transaction_id,
-        "description": payment.description,
-        "created_at": payment.created_at.isoformat() if payment.created_at else None,
-        "completed_at": payment.completed_at.isoformat() if payment.completed_at else None
-    }
-
-# --- POINTS CONVERSION API ---
-
-@app.post("/points/convert")
-def convert_points_to_balance(req: dict, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Đổi điểm tích lũy thành tiền - Tỷ lệ: 100 điểm = 10₫"""
-    points_to_convert = req.get("points", 0)
-    
-    if points_to_convert <= 0:
-        raise HTTPException(status_code=400, detail="Số điểm phải lớn hơn 0")
-    
-    if points_to_convert > current_user.points:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Không đủ điểm. Bạn có {current_user.points} điểm, yêu cầu: {points_to_convert} điểm"
-        )
-    
-    # Tỷ lệ: 100 điểm = 10₫ (tỷ lệ 1:10)
-    balance_to_add = (points_to_convert * 10)  # 100 điểm = 1000 cents = 10₫
-    
-    # Merge user vào session
-    user_in_session = db.merge(current_user)
-    
-    # Trừ điểm và cộng tiền
-    user_in_session.points -= points_to_convert
-    user_in_session.balance_cents += balance_to_add
-    
-    db.commit()
-    db.refresh(user_in_session)
-    
-    return {
-        "message": f"Đã đổi {points_to_convert} điểm thành {balance_to_add / 100}₫",
-        "points_converted": points_to_convert,
-        "balance_added_cents": balance_to_add,
-        "new_points": user_in_session.points,
-        "new_balance_cents": user_in_session.balance_cents
-    }
-
-# --- USAGE & ANALYTICS APIs ---
-
 @app.get("/subscription/storage-info")
-def get_subscription_storage_info(
+def get_storage_info(
     current_user: models.User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-    test_mode: bool = Query(False, description="Chế độ test - dùng random data cho tổng dung lượng"),
+    db: Session = Depends(get_db)
 ):
-    """
-    Lấy thông tin subscription và storage usage để hiển thị ở trang Database.
-    - Mặc định dùng dữ liệu THẬT (query từ MySQL).
-    - Chỉ khi test_mode=true mới dùng random (phục vụ test quota).
-    """
-    # Lấy active subscription
+    """Lấy thông tin storage của subscription"""
+    # Kiểm tra user có subscription active không
     active_sub = db.query(models.Subscription).filter(
         models.Subscription.user_id == current_user.id,
         models.Subscription.status == "ACTIVE"
     ).first()
-
+    
     if not active_sub:
         return {
             "has_subscription": False,
-            "message": "Bạn cần đăng ký gói dịch vụ trước khi tạo database"
+            "total_storage_mb": 0,
+            "used_storage_mb": 0,
+            "available_storage_mb": 0,
+            "usage_percent": 0
         }
-
+    
     # Lấy plan info
     plan = db.query(models.PricingPlan).filter(models.PricingPlan.id == active_sub.plan_id).first()
     if not plan:
-        return {"has_subscription": False, "message": "Plan not found"}
-
-    # Sử dụng cùng logic với check_and_update_quota_status để tính tổng dung lượng
-    quota_info = check_and_update_quota_status(current_user.id, db, test_mode=test_mode)
-    if not quota_info:
-        # Fallback nếu vì lý do nào đó không tính được quota
         return {
             "has_subscription": True,
-            "subscription": {
-                "id": active_sub.id,
-                "plan_id": active_sub.plan_id,
-                "plan_name": plan.name,
-                "expires_at": active_sub.expires_at.isoformat() if active_sub.expires_at else None,
-            },
-            "storage": {
-                "plan_limit_mb": plan.storage_mb,
-                "used_mb": 0,
-                "available_mb": plan.storage_mb,
-                "used_percent": 0,
-                "quota_status": "NORMAL",
-            },
+            "total_storage_mb": 0,
+            "used_storage_mb": 0,
+            "available_storage_mb": 0,
+            "usage_percent": 0
         }
-
-    total_used_mb = quota_info["total_used_mb"]
-    plan_limit_mb = quota_info["plan_limit_mb"]
-    used_percent = quota_info["used_percent"]
-    quota_status = quota_info["quota_status"]
-
-    available_storage_mb = max(0, plan_limit_mb - total_used_mb)
-
-    return {
-        "has_subscription": True,
-        "subscription": {
-            "id": active_sub.id,
-            "plan_id": active_sub.plan_id,
-            "plan_name": plan.name,
-            "expires_at": active_sub.expires_at.isoformat() if active_sub.expires_at else None
-        },
-        "storage": {
-            "plan_limit_mb": plan_limit_mb,
-            "used_mb": round(total_used_mb, 2),
-            "available_mb": round(available_storage_mb, 2),
-            "used_percent": used_percent,
-            "quota_status": quota_status,
-        }
-    }
-
-@app.get("/usage/stats", response_model=schemas.UsageStats)
-def get_usage_stats(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Thống kê sử dụng tổng quan của user"""
-    # Đếm databases
-    all_dbs = db.query(models.Database).filter(models.Database.owner_id == current_user.id).all()
-    active_dbs = [db_obj for db_obj in all_dbs if db_obj.status == "ACTIVE"]
     
-    # Tính tổng storage
-    total_storage = sum(db_obj.quota_mb for db_obj in all_dbs)
-    # Mock used storage (trong thực tế sẽ query từ MySQL)
-    # Query thực tế từ MySQL thay vì dùng random
-    used_storage = 0.0
+    # Query tổng storage thực tế từ MySQL
+    total_used_storage_mb = 0.0
     try:
         from services.mysql_service import MySQLService
         mysql_service = MySQLService()
         conn = mysql_service.connect()
         cur = conn.cursor()
         
-        for db_obj in active_dbs:
+        existing_dbs = db.query(models.Database).filter(
+            models.Database.owner_id == current_user.id,
+            models.Database.status == "ACTIVE"
+        ).all()
+        
+        for db_obj in existing_dbs:
             if db_obj.physical_db_name:
                 try:
                     cur.execute(f"""
@@ -1045,61 +1413,294 @@ def get_usage_stats(current_user: models.User = Depends(get_current_user), db: S
                     """)
                     result = cur.fetchone()
                     if result and result[0] is not None:
-                        used_storage += float(result[0])
+                        total_used_storage_mb += float(result[0])
                 except Exception:
-                    # Nếu không query được, bỏ qua database này
+                    pass
+        
+        conn.close()
+    except Exception as e:
+        print(f"Error calculating storage: {e}")
+        total_used_storage_mb = 0.0
+    
+    total_storage_mb = plan.storage_mb
+    available_storage_mb = max(0, total_storage_mb - total_used_storage_mb)
+    usage_percent = (total_used_storage_mb / total_storage_mb * 100) if total_storage_mb > 0 else 0
+    
+    return {
+        "has_subscription": True,
+        "total_storage_mb": total_storage_mb,
+        "used_storage_mb": round(total_used_storage_mb, 2),
+        "available_storage_mb": round(available_storage_mb, 2),
+        "usage_percent": round(usage_percent, 2),
+        "plan_name": plan.name
+    }
+
+@app.get("/subscriptions")
+def list_subscriptions(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Lấy danh sách subscriptions của user"""
+    subscriptions = db.query(models.Subscription).filter(
+        models.Subscription.user_id == current_user.id
+    ).order_by(models.Subscription.created_at.desc()).all()
+    
+    result = []
+    for sub in subscriptions:
+        plan = db.query(models.PricingPlan).filter(models.PricingPlan.id == sub.plan_id).first()
+        result.append({
+            "id": sub.id,
+            "plan_id": sub.plan_id,
+            "plan_name": plan.name if plan else "Unknown",
+            "status": sub.status,
+            "created_at": sub.created_at.isoformat() if sub.created_at else None,
+            "expires_at": sub.expires_at.isoformat() if sub.expires_at else None,
+            "auto_renew": sub.auto_renew
+        })
+    
+    return result
+
+@app.post("/subscriptions")
+def create_subscription(
+    req: dict = Body(...),
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Tạo subscription mới cho user"""
+    plan_id = req.get("plan_id")
+    auto_renew = req.get("auto_renew", True)
+    
+    if not plan_id:
+        raise HTTPException(status_code=400, detail="plan_id is required")
+    
+    # Kiểm tra plan có tồn tại không
+    plan = db.query(models.PricingPlan).filter(models.PricingPlan.id == plan_id).first()
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    
+    # Kiểm tra user đã có subscription active chưa
+    existing_active = db.query(models.Subscription).filter(
+        models.Subscription.user_id == current_user.id,
+        models.Subscription.status == "ACTIVE"
+    ).first()
+    
+    if existing_active:
+        raise HTTPException(
+            status_code=400,
+            detail="You already have an active subscription. Please cancel it first before subscribing to a new plan."
+        )
+    
+    # Kiểm tra số dư
+    price_cents = plan.price_monthly_cents
+    if price_cents > 0:
+        if current_user.balance_cents < price_cents:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Insufficient balance. Required: {price_cents/100:.2f}₫, Available: {current_user.balance_cents/100:.2f}₫"
+            )
+        
+        # Trừ tiền từ balance
+        current_user.balance_cents -= price_cents
+        
+        # Tạo payment record
+        payment = models.Payment(
+            user_id=current_user.id,
+            amount_cents=price_cents,
+            currency="VND",
+            status="COMPLETED",
+            payment_method="BALANCE",
+            description=f"Subscription: {plan.name}"
+        )
+        db.add(payment)
+    
+    # Tạo subscription
+    from datetime import datetime, timedelta
+    expires_at = datetime.utcnow() + timedelta(days=30)  # 30 days subscription
+    
+    subscription = models.Subscription(
+        user_id=current_user.id,
+        plan_id=plan_id,
+        status="ACTIVE",
+        auto_renew=1 if auto_renew else 0,
+        expires_at=expires_at
+    )
+    db.add(subscription)
+    db.commit()
+    db.refresh(subscription)
+    
+    return {
+        "id": subscription.id,
+        "plan_id": subscription.plan_id,
+        "plan_name": plan.name,
+        "status": subscription.status,
+        "created_at": subscription.created_at.isoformat() if subscription.created_at else None,
+        "expires_at": subscription.expires_at.isoformat() if subscription.expires_at else None,
+        "auto_renew": subscription.auto_renew
+    }
+
+@app.post("/subscriptions/{sub_id}/cancel")
+def cancel_subscription(
+    sub_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Hủy subscription"""
+    subscription = db.query(models.Subscription).filter(
+        models.Subscription.id == sub_id,
+        models.Subscription.user_id == current_user.id
+    ).first()
+    
+    if not subscription:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    
+    if subscription.status != "ACTIVE":
+        raise HTTPException(status_code=400, detail="Only active subscriptions can be cancelled")
+    
+    subscription.status = "CANCELLED"
+    subscription.auto_renew = False
+    db.commit()
+    
+    return {"message": "Subscription cancelled successfully"}
+
+@app.post("/subscriptions/{sub_id}/auto-renew")
+def toggle_auto_renew(
+    sub_id: int,
+    req: dict,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Toggle auto-renew cho subscription"""
+    subscription = db.query(models.Subscription).filter(
+        models.Subscription.id == sub_id,
+        models.Subscription.user_id == current_user.id
+    ).first()
+    
+    if not subscription:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    
+    auto_renew = req.get("auto_renew", True) if req else True
+    subscription.auto_renew = 1 if auto_renew else 0
+    db.commit()
+    
+    return {
+        "id": subscription.id,
+        "auto_renew": bool(subscription.auto_renew)
+    }
+
+@app.get("/subscriptions/active")
+def get_active_subscription(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Lấy subscription active của user"""
+    active_sub = db.query(models.Subscription).filter(
+        models.Subscription.user_id == current_user.id,
+        models.Subscription.status == "ACTIVE"
+    ).first()
+    
+    if not active_sub:
+        raise HTTPException(status_code=404, detail="No active subscription found")
+    
+    plan = db.query(models.PricingPlan).filter(models.PricingPlan.id == active_sub.plan_id).first()
+    
+    return {
+        "id": active_sub.id,
+        "plan_id": active_sub.plan_id,
+        "plan_name": plan.name if plan else "Unknown",
+        "status": active_sub.status,
+        "created_at": active_sub.created_at.isoformat() if active_sub.created_at else None,
+        "expires_at": active_sub.expires_at.isoformat() if active_sub.expires_at else None,
+        "auto_renew": active_sub.auto_renew
+    }
+
+@app.get("/usage/stats")
+def get_usage_stats(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Lấy thống kê sử dụng của user"""
+    databases = db.query(models.Database).filter(
+        models.Database.owner_id == current_user.id
+    ).all()
+    
+    active_databases = [db for db in databases if db.status == "ACTIVE"]
+    
+    # Tính tổng storage đã dùng
+    total_used_storage_mb = 0.0
+    try:
+        from services.mysql_service import MySQLService
+        mysql_service = MySQLService()
+        conn = mysql_service.connect()
+        cur = conn.cursor()
+        
+        for db_obj in active_databases:
+            if db_obj.physical_db_name:
+                try:
+                    cur.execute(f"""
+                        SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024, 2) AS size_mb
+                        FROM information_schema.tables 
+                        WHERE table_schema = '{db_obj.physical_db_name}'
+                    """)
+                    result = cur.fetchone()
+                    if result and result[0] is not None:
+                        total_used_storage_mb += float(result[0])
+                except Exception:
                     pass
         
         conn.close()
     except Exception:
-        # Nếu không query được, dùng 0
-        used_storage = 0.0
+        total_used_storage_mb = 0.0
     
-    # Đếm payments
+    # Lấy subscription active
+    active_sub = db.query(models.Subscription).filter(
+        models.Subscription.user_id == current_user.id,
+        models.Subscription.status == "ACTIVE"
+    ).first()
+    
+    plan_storage_mb = 0
+    if active_sub:
+        plan = db.query(models.PricingPlan).filter(models.PricingPlan.id == active_sub.plan_id).first()
+        if plan:
+            plan_storage_mb = plan.storage_mb
+    
+    # Tính tổng chi tiêu (từ payments)
     payments = db.query(models.Payment).filter(
         models.Payment.user_id == current_user.id,
         models.Payment.status == "COMPLETED"
     ).all()
-    total_spent = sum(p.amount_cents for p in payments)
     
-    # Đếm active subscriptions
-    active_subs = db.query(models.Subscription).filter(
-        models.Subscription.user_id == current_user.id,
-        models.Subscription.status == "ACTIVE"
-    ).count()
+    total_spent_cents = sum(p.amount_cents for p in payments)
     
     return {
-        "total_databases": len(all_dbs),
-        "active_databases": len(active_dbs),
-        "total_storage_mb": total_storage,
-        "used_storage_mb": round(used_storage, 2),
-        "total_payments": len(payments),
-        "total_spent_cents": total_spent,
-        "active_subscriptions": active_subs
+        "total_databases": len(databases),
+        "active_databases": len(active_databases),
+        "active_subscriptions": 1 if active_sub else 0,
+        "total_used_storage_mb": round(total_used_storage_mb, 2),
+        "plan_storage_mb": plan_storage_mb,
+        "total_spent_cents": total_spent_cents
     }
 
-@app.get("/invoices", response_model=list[schemas.InvoiceOut])
-def get_invoices(current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Lấy danh sách hóa đơn (tạo từ payments có subscription_id)"""
-    # Lấy các payment có subscription_id (thanh toán cho subscription)
+@app.get("/invoices")
+def list_invoices(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Lấy danh sách invoices (payments) của user"""
     payments = db.query(models.Payment).filter(
-        models.Payment.user_id == current_user.id,
-        models.Payment.subscription_id.isnot(None)
+        models.Payment.user_id == current_user.id
     ).order_by(models.Payment.created_at.desc()).all()
     
-    invoices = []
+    result = []
     for payment in payments:
-        sub = db.query(models.Subscription).filter(models.Subscription.id == payment.subscription_id).first()
-        invoices.append({
+        result.append({
             "id": payment.id,
-            "subscription_id": payment.subscription_id,
-            "payment_id": payment.id,
             "amount_cents": payment.amount_cents,
             "currency": payment.currency,
             "status": payment.status,
-            "period_start": sub.started_at.isoformat() if sub and sub.started_at else None,
-            "period_end": sub.expires_at.isoformat() if sub and sub.expires_at else None,
-            "created_at": payment.created_at.isoformat() if payment.created_at else None
+            "payment_method": payment.payment_method,
+            "description": payment.description,
+            "created_at": payment.created_at.isoformat() if payment.created_at else None,
+            "completed_at": payment.completed_at.isoformat() if payment.completed_at else None
         })
     
-    return invoices
+    return result

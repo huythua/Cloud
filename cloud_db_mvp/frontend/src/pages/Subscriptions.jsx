@@ -2,6 +2,9 @@ import React, { useEffect, useState } from 'react'
 import { useAuth } from '../AuthContext'
 import { API_URL } from '../config'
 import { Link } from 'react-router-dom'
+import Footer from '../components/Footer'
+import { ErrorMessage, SuccessMessage } from '../components/ErrorMessage'
+import { FiAlertTriangle, FiCheckCircle, FiPackage, FiHardDrive, FiUsers, FiDatabase, FiHome, FiCreditCard, FiBarChart2, FiUser, FiLogOut } from 'react-icons/fi'
 
 export default function Subscriptions(){
   const { token, user, refreshUser } = useAuth()
@@ -10,6 +13,7 @@ export default function Subscriptions(){
   const [activeSub, setActiveSub] = useState(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
+  const [success, setSuccess] = useState(null)
 
   useEffect(() => {
     if(!token) return
@@ -76,10 +80,10 @@ export default function Subscriptions(){
     const planPrice = plan?.price_monthly_cents || 0
     
     // Confirm dialog với cảnh báo
-    const confirmMsg = `⚠️ XÁC NHẬN ĐĂNG KÝ GÓI DỊCH VỤ\n\n` +
+    const confirmMsg = `XÁC NHẬN ĐĂNG KÝ GÓI DỊCH VỤ\n\n` +
       `Gói: ${planName}\n` +
       `Giá: ${planPrice > 0 ? `${(planPrice / 100).toLocaleString('vi-VN')}₫/tháng` : 'Miễn phí'}\n\n` +
-      `⚠️ CẢNH BÁO:\n` +
+      `CẢNH BÁO:\n` +
       `• Số dư tài khoản sẽ bị trừ ${planPrice > 0 ? `${(planPrice / 100).toLocaleString('vi-VN')}₫` : '0₫'} ngay lập tức\n` +
       `• Nếu hủy đăng ký sau này, bạn sẽ KHÔNG được hoàn tiền\n` +
       `• Auto-renew: ${autoRenew ? 'BẬT' : 'TẮT'} (tự động gia hạn mỗi tháng)\n\n` +
@@ -101,7 +105,7 @@ export default function Subscriptions(){
       })
       const data = await res.json()
       if(res.ok){
-        alert('✅ Đăng ký thành công! Số dư đã được trừ.')
+        setSuccess('Đăng ký thành công! Số dư đã được trừ.')
         fetchSubscriptions()
         // Refresh user để cập nhật số dư - đợi một chút để đảm bảo backend đã commit
         if(refreshUser) {
@@ -112,21 +116,21 @@ export default function Subscriptions(){
       } else {
         const errorMsg = data.detail || 'Đăng ký thất bại'
         if(errorMsg.includes('Insufficient balance')){
-          alert(`❌ ${errorMsg}\n\nVui lòng nạp tiền trước khi đăng ký gói.`)
+          setError(`${errorMsg}\n\nVui lòng nạp tiền trước khi đăng ký gói.`)
         } else {
-          alert(`❌ ${errorMsg}`)
+          setError(errorMsg)
         }
       }
     } catch(err) {
-      alert('Lỗi: ' + err)
+      setError('Lỗi kết nối: ' + err.message)
     }
   }
 
   async function handleCancel(subId){
     const sub = subscriptions.find(s => s.id === subId)
-    const confirmMsg = `⚠️ XÁC NHẬN HỦY ĐĂNG KÝ\n\n` +
+    const confirmMsg = `XÁC NHẬN HỦY ĐĂNG KÝ\n\n` +
       `Bạn có chắc chắn muốn hủy subscription này?\n\n` +
-      `⚠️ CẢNH BÁO QUAN TRỌNG:\n` +
+      `CẢNH BÁO QUAN TRỌNG:\n` +
       `• Bạn sẽ KHÔNG được hoàn tiền đã thanh toán\n` +
       `• Tất cả databases của bạn có thể bị ảnh hưởng\n` +
       `• Bạn sẽ không thể tạo database mới cho đến khi đăng ký lại gói dịch vụ\n\n` +
@@ -141,13 +145,13 @@ export default function Subscriptions(){
       })
       const data = await res.json()
       if(res.ok){
-        alert('✅ Đã hủy subscription thành công')
+        setSuccess('Đã hủy subscription thành công')
         fetchSubscriptions()
       } else {
-        alert('❌ Hủy thất bại: ' + (data.detail || 'Unknown error'))
+        setError('Hủy thất bại: ' + (data.detail || 'Unknown error'))
       }
     } catch(err) {
-      alert('Lỗi: ' + err)
+      setError('Lỗi kết nối: ' + err.message)
     }
   }
 
@@ -159,12 +163,13 @@ export default function Subscriptions(){
       })
       const data = await res.json()
       if(res.ok){
+        setSuccess(data.message || 'Đã cập nhật auto-renew thành công')
         fetchSubscriptions()
       } else {
-        alert('❌ Thay đổi auto-renew thất bại: ' + (data.detail || 'Unknown error'))
+        setError('Thay đổi auto-renew thất bại: ' + (data.detail || 'Unknown error'))
       }
     } catch(err) {
-      alert('Lỗi: ' + err)
+      setError('Lỗi kết nối: ' + err.message)
     }
   }
 
@@ -184,7 +189,7 @@ export default function Subscriptions(){
 
         {activeSub && (
           <div className="alert alert-info">
-            <strong>✅ Gói đang dùng:</strong> Bạn đang sử dụng gói subscription ID {activeSub.id}
+            <strong>Gói đang dùng:</strong> Bạn đang sử dụng gói subscription ID {activeSub.id}
             {activeSub.expires_at && (
               <span> - Hết hạn: {new Date(activeSub.expires_at).toLocaleDateString('vi-VN')}</span>
             )}
@@ -193,18 +198,19 @@ export default function Subscriptions(){
         
         {!activeSub && (
           <div className="alert alert-warning" style={{background: '#fef3c7', color: '#d97706', border: '1px solid #fcd34d'}}>
-            <strong>⚠️ Chưa có gói dịch vụ:</strong> Bạn cần đăng ký gói dịch vụ và có đủ số dư để tạo database.
+            <strong>Chưa có gói dịch vụ:</strong> Bạn cần đăng ký gói dịch vụ và có đủ số dư để tạo database.
           </div>
         )}
 
-        {error && <div className="alert alert-error">{error}</div>}
+        {error && <ErrorMessage message={error} onClose={() => setError(null)} />}
+        {success && <SuccessMessage message={success} onClose={() => setSuccess(null)} autoClose={true} />}
         {loading && <div className="loading">Đang tải...</div>}
 
         <section className="plans-section">
           <h2>Bảng giá</h2>
           {!loading && plans.length === 0 && (
             <div className="empty-state">
-              <div className="empty-icon">📦</div>
+              <FiPackage size={48} style={{ color: '#9ca3af' }} />
               <h3>Chưa có gói dịch vụ nào</h3>
             </div>
           )}
@@ -228,7 +234,7 @@ export default function Subscriptions(){
           {loading && <div className="loading">Đang tải...</div>}
           {!loading && subscriptions.length === 0 ? (
             <div className="empty-state">
-              <div className="empty-icon">📦</div>
+              <FiPackage size={48} style={{ color: '#9ca3af' }} />
               <h3>Chưa có subscription nào</h3>
               <p>Đăng ký gói dịch vụ để bắt đầu sử dụng</p>
             </div>
@@ -278,6 +284,7 @@ export default function Subscriptions(){
             <li><strong>4.</strong> Hủy gói sẽ không hoàn tiền đã thanh toán, và có thể ảnh hưởng đến khả năng tạo / dùng database.</li>
           </ul>
         </section>
+        <Footer />
       </div>
     </div>
   )
@@ -316,18 +323,18 @@ function PlanCard({ plan, onSubscribe, isActive, userBalance }){
       <div className="plan-price">{formatPrice(plan.price_monthly_cents)}</div>
       <div className="plan-features">
         <div className="feature-item">
-          <span className="feature-icon">💾</span>
+          <FiHardDrive size={16} />
           <span>{plan.storage_mb >= 1024 ? `${plan.storage_mb / 1024} GB` : `${plan.storage_mb} MB`} lưu trữ</span>
         </div>
         <div className="feature-item">
-          <span className="feature-icon">👥</span>
+          <FiUsers size={16} />
           <span>{plan.users_allowed} user</span>
         </div>
       </div>
       {plan.description && <p className="plan-desc">{plan.description}</p>}
       {insufficientBalance && !isActive && (
         <div className="alert alert-error" style={{marginTop: '12px', padding: '8px 12px', fontSize: '12px'}}>
-          ⚠️ Số dư không đủ. Cần: {formatPrice(plan.price_monthly_cents)}
+          <FiAlertTriangle size={14} style={{ marginRight: '4px', verticalAlign: 'middle' }} /> Số dư không đủ. Cần: {formatPrice(plan.price_monthly_cents)}
         </div>
       )}
       <button 
@@ -370,37 +377,52 @@ function Sidebar(){
   return (
     <aside className="sidebar">
       <div className="sidebar-header">
-        <h2>CloudDB</h2>
+        <div style={{display: 'flex', alignItems: 'center', gap: '12px'}}>
+          <div style={{
+            width: '40px',
+            height: '40px',
+            borderRadius: '10px',
+            background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            fontSize: '24px',
+            boxShadow: '0 4px 6px rgba(102, 126, 234, 0.3)'
+          }}>
+            <FiDatabase size={24} style={{ color: 'white' }} />
+          </div>
+          <h2 style={{margin: 0, fontSize: '24px', fontWeight: '700', background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text'}}>CloudDB</h2>
+        </div>
       </div>
       <nav className="sidebar-nav">
         <Link to="/app" className="nav-item">
-          <span className="nav-icon">🏠</span>
+          <FiHome size={18} className="nav-icon" />
           <span>Trang chủ</span>
         </Link>
         <Link to="/app/databases" className="nav-item">
-          <span className="nav-icon">🗄️</span>
+          <FiDatabase size={18} className="nav-icon" />
           <span>Quản lý Database</span>
         </Link>
         <Link to="/app/subscriptions" className="nav-item active">
-          <span className="nav-icon">📦</span>
+          <FiPackage size={18} className="nav-icon" />
           <span>Gói dịch vụ</span>
         </Link>
         <Link to="/app/payments" className="nav-item">
-          <span className="nav-icon">💳</span>
+          <FiCreditCard size={18} className="nav-icon" />
           <span>Thanh toán</span>
         </Link>
         <Link to="/app/usage" className="nav-item">
-          <span className="nav-icon">📊</span>
+          <FiBarChart2 size={18} className="nav-icon" />
           <span>Thống kê</span>
         </Link>
         <Link to="/app/profile" className="nav-item">
-          <span className="nav-icon">👤</span>
+          <FiUser size={18} className="nav-icon" />
           <span>Tài khoản</span>
         </Link>
       </nav>
       <div className="sidebar-footer">
         <button className="logout-btn" onClick={() => { clearToken(); window.location.href = '/login' }}>
-          <span className="nav-icon">🚪</span>
+          <FiLogOut size={18} className="nav-icon" />
           <span>Đăng xuất</span>
         </button>
       </div>

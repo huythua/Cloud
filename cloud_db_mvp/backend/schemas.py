@@ -4,7 +4,8 @@ schemas.py - Pydantic models for API
 """
 
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
+from datetime import datetime
 
 class UserOut(BaseModel):
     id: int
@@ -21,6 +22,9 @@ class UserRegister(BaseModel):
 class UserLogin(BaseModel):
     email: str
     password: str
+
+class GoogleCallbackRequest(BaseModel):
+    code: str
 
 class CreateDatabase(BaseModel):
     name: str
@@ -156,6 +160,20 @@ class ConvertPointsResponse(BaseModel):
     new_points: int
 
 
+# --- VNPay Schemas ---
+class CreateVNPayPayment(BaseModel):
+    """Yêu cầu tạo payment URL VNPay"""
+    amount_cents: int
+    description: Optional[str] = None
+    subscription_id: Optional[int] = None
+    bank_code: Optional[str] = None  # Mã ngân hàng (optional)
+
+class VNPayPaymentUrlResponse(BaseModel):
+    """Response chứa payment URL từ VNPay"""
+    payment_url: str
+    payment_id: int
+
+
 # --- Usage & Analytics Schemas ---
 class UsageStats(BaseModel):
     """Thống kê sử dụng tổng quan"""
@@ -180,3 +198,157 @@ class InvoiceOut(BaseModel):
     created_at: Optional[str] = None
     class Config:
         from_attributes = True
+
+
+# --- Backup & Restore Schemas ---
+class CreateBackupRequest(BaseModel):
+    """Yêu cầu tạo backup"""
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+class BackupOut(BaseModel):
+    """Thông tin backup"""
+    id: int
+    database_id: int
+    name: Optional[str] = None
+    description: Optional[str] = None
+    file_path: Optional[str] = None
+    size_mb: Optional[float] = None
+    status: str
+    created_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    error_message: Optional[str] = None
+    class Config:
+        from_attributes = True
+
+class RestoreRequest(BaseModel):
+    """Yêu cầu restore từ backup"""
+    backup_id: int
+
+class RestoreOut(BaseModel):
+    """Thông tin restore"""
+    id: int
+    database_id: int
+    backup_id: int
+    status: str
+    created_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    error_message: Optional[str] = None
+    class Config:
+        from_attributes = True
+
+
+# --- Monitoring & Performance Metrics Schemas ---
+class PerformanceMetricOut(BaseModel):
+    """Performance metric data point"""
+    id: int
+    database_id: int
+    metric_type: str
+    value: float
+    metric_metadata: Optional[str] = None
+    timestamp: Optional[datetime] = None
+    class Config:
+        from_attributes = True
+
+class MetricsResponse(BaseModel):
+    """Response cho metrics endpoint"""
+    database_id: int
+    timeframe: str
+    metrics: dict  # { "CPU": [...], "MEMORY": [...], "CONNECTIONS": [...] }
+    summary: Optional[dict] = None  # Summary stats
+
+class ConnectionInfo(BaseModel):
+    """Thông tin connection"""
+    id: int
+    user: str
+    host: str
+    db: Optional[str] = None
+    command: str
+    time: int
+    state: Optional[str] = None
+    info: Optional[str] = None
+
+class ConnectionsResponse(BaseModel):
+    """Response cho connections endpoint"""
+    database_id: int
+    active: int
+    max_connections: int
+    connections: List[ConnectionInfo]
+
+class SlowQueryOut(BaseModel):
+    """Slow query information"""
+    id: int
+    database_id: int
+    query_text: str
+    duration_ms: float
+    rows_examined: Optional[int] = None
+    rows_sent: Optional[int] = None
+    timestamp: Optional[datetime] = None
+    class Config:
+        from_attributes = True
+
+class PerformanceSummary(BaseModel):
+    """Performance summary statistics"""
+    database_id: int
+    qps: float  # Queries per second
+    avg_response_time_ms: float
+    error_rate: float
+    active_connections: int
+    max_connections: int
+    cpu_usage_percent: Optional[float] = None
+    memory_usage_mb: Optional[float] = None
+    slow_queries_count: int
+
+
+# --- Database Cloning Schemas ---
+class CloneRequest(BaseModel):
+    """Yêu cầu clone database"""
+    name: str
+    description: Optional[str] = None
+
+class CloneOut(BaseModel):
+    """Thông tin clone operation"""
+    id: int
+    source_database_id: int
+    cloned_database_id: Optional[int] = None
+    name: str
+    description: Optional[str] = None
+    status: str
+    created_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    error_message: Optional[str] = None
+    class Config:
+        from_attributes = True
+
+
+# --- Database Export/Import Schemas ---
+class ImportOut(BaseModel):
+    """Thông tin import operation"""
+    id: int
+    database_id: int
+    file_name: str
+    file_path: str
+    file_size_mb: Optional[float] = None
+    status: str
+    created_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    error_message: Optional[str] = None
+    class Config:
+        from_attributes = True
+
+
+# --- SQL Query Execution Schemas ---
+class SQLQueryRequest(BaseModel):
+    """Yêu cầu execute SQL query"""
+    query: str
+
+class SQLQueryResponse(BaseModel):
+    """Response cho SQL query execution"""
+    success: bool
+    columns: List[str]
+    rows: List[List[Optional[str]]]
+    row_count: int
+    affected_rows: int
+    execution_time_ms: float
+    query_type: str
+    message: str

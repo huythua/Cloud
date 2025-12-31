@@ -3,8 +3,10 @@ import { createRoot } from 'react-dom/client'
 import { BrowserRouter, Routes, Route, Link } from 'react-router-dom'
 import Login from './pages/Login'
 import Register from './pages/Register'
+import GoogleCallback from './pages/GoogleCallback'
 import Dashboard from './pages/Dashboard'
 import Databases from './pages/Databases'
+import DatabaseDetail from './pages/DatabaseDetail'
 import Subscriptions from './pages/Subscriptions'
 import Payments from './pages/Payments'
 import Usage from './pages/Usage'
@@ -38,20 +40,8 @@ function App(){
         <Routes>
           <Route path="/login" element={
             <>
-              <nav className="nav">
-                <div className="nav-inner">
-                  <div className="brand">
-                    <img src={logo} alt="CloudDB" className="logo" />
-                    <div>
-                      <div className="brand-title">CloudDB — Thuê & Dùng Database</div>
-                      <div className="brand-sub">Nền tảng quản lý database cloud</div>
-                    </div>
-                  </div>
-                  <NavButtons />
-                </div>
-              </nav>
-              <div className="hero">
-                <div className="container auth-wrap">
+              <div className="auth-page">
+                <div className="auth-container">
                   <Login/>
                 </div>
               </div>
@@ -59,47 +49,44 @@ function App(){
           } />
           <Route path="/register" element={
             <>
-              <nav className="nav">
-                <div className="nav-inner">
-                  <div className="brand">
-                    <img src={logo} alt="CloudDB" className="logo" />
-                    <div>
-                      <div className="brand-title">CloudDB — Thuê & Dùng Database</div>
-                      <div className="brand-sub">Nền tảng quản lý database cloud</div>
-                    </div>
-                  </div>
-                  <NavButtons />
-                </div>
-              </nav>
-              <div className="hero">
-                <div className="container auth-wrap">
+              <div className="auth-page">
+                <div className="auth-container">
                   <Register/>
                 </div>
               </div>
             </>
           } />
-          <Route path="/app" element={<Dashboard/>} />
-          <Route path="/app/databases" element={<Databases/>} />
-          <Route path="/app/subscriptions" element={<Subscriptions/>} />
-          <Route path="/app/payments" element={<Payments/>} />
-          <Route path="/app/usage" element={<Usage/>} />
-          <Route path="/app/profile" element={<Profile/>} />
-          <Route path="/" element={
+          <Route path="/auth/google/callback" element={
             <>
               <nav className="nav">
                 <div className="nav-inner">
                   <div className="brand">
                     <img src={logo} alt="CloudDB" className="logo" />
                     <div>
-                      <div className="brand-title">CloudDB — Thuê & Dùng Database</div>
-                      <div className="brand-sub">Nền tảng quản lý database cloud</div>
+                      <div className="brand-title">CloudDB</div>
+                      <div className="brand-sub">Database as a Service Platform</div>
                     </div>
                   </div>
-                  <NavButtons />
                 </div>
               </nav>
               <div className="hero">
                 <div className="container auth-wrap">
+                  <GoogleCallback/>
+                </div>
+              </div>
+            </>
+          } />
+          <Route path="/app" element={<Dashboard/>} />
+          <Route path="/app/databases" element={<Databases/>} />
+          <Route path="/app/databases/:id" element={<DatabaseDetail/>} />
+          <Route path="/app/subscriptions" element={<Subscriptions/>} />
+          <Route path="/app/payments" element={<Payments/>} />
+          <Route path="/app/usage" element={<Usage/>} />
+          <Route path="/app/profile" element={<Profile/>} />
+          <Route path="/" element={
+            <>
+              <div className="auth-page">
+                <div className="auth-container">
                   <Login/>
                 </div>
               </div>

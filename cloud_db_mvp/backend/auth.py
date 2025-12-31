@@ -29,6 +29,9 @@ def authenticate_user(db, email, password):
     user = db.query(models.User).filter(models.User.email == email).first()
     if not user:
         return False
+    # Check if user has password (not Google OAuth user)
+    if not user.hashed_password:
+        return False  # Google OAuth users cannot login with password
     if not verify_password(password, user.hashed_password):
         return False
     return user

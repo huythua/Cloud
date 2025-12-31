@@ -1,7 +1,11 @@
 import React, { useEffect, useState } from 'react'
 import { useAuth } from '../AuthContext'
 import { API_URL } from '../config'
-import { Link, useSearchParams } from 'react-router-dom'
+import { Link, useSearchParams, useNavigate } from 'react-router-dom'
+import Footer from '../components/Footer'
+import { ErrorMessage, SuccessMessage } from '../components/ErrorMessage'
+import { FiEye, FiTrash2, FiRefreshCw, FiAlertTriangle, FiDatabase, FiPlus, FiPackage, FiHome, FiCreditCard, FiBarChart2, FiUser, FiLogOut, FiCopy, FiX, FiBookOpen, FiLock, FiInfo, FiClipboard } from 'react-icons/fi'
+// Removed imports - all features moved to DatabaseDetail page
 
 export default function Databases(){
   const { token } = useAuth()
@@ -10,18 +14,21 @@ export default function Databases(){
   const [error, setError] = useState(null)
   const [showCreateForm, setShowCreateForm] = useState(false)
   const [searchParams] = useSearchParams()
-  const [testMode, setTestMode] = useState(() => {
-    // Load từ localStorage
-    return localStorage.getItem('db_test_mode') === 'true'
-  })
+  // Removed test mode - production only
   const [storageInfo, setStorageInfo] = useState(null)
   const [loadingStorage, setLoadingStorage] = useState(false)
+  const [success, setSuccess] = useState(null)
 
   useEffect(() => {
     if(!token) return
-    if(searchParams.get('action') === 'create') setShowCreateForm(true)
-    fetchDbs()
-    fetchStorageSummary()
+    try {
+      if(searchParams.get('action') === 'create') setShowCreateForm(true)
+      fetchDbs()
+      fetchStorageSummary()
+    } catch(err) {
+      console.error('Error in useEffect:', err)
+      setError('Lỗi khởi tạo trang: ' + err.message)
+    }
   }, [token, searchParams])
 
   async function fetchDbs(){
@@ -50,37 +57,56 @@ export default function Databases(){
     setLoadingStorage(true)
     try {
       const url = new URL(`${API_URL}/subscription/storage-info`)
-      if (testMode) {
-        url.searchParams.set('test_mode', 'true')
-      }
+      // Removed test mode
       const res = await fetch(url, {
         headers: { 'Authorization': `Bearer ${token}` }
       })
       if(res.ok){
         const data = await res.json()
         setStorageInfo(data)
+      } else {
+        console.warn('Failed to fetch storage info:', res.status)
+        // Set default values để tránh lỗi render
+        setStorageInfo({
+          has_subscription: false,
+          total_storage_mb: 0,
+          used_storage_mb: 0,
+          available_storage_mb: 0,
+          usage_percent: 0
+        })
       }
     } catch(err) {
       console.error('Failed to fetch storage summary:', err)
+      // Set default values để tránh lỗi render
+      setStorageInfo({
+        has_subscription: false,
+        total_storage_mb: 0,
+        used_storage_mb: 0,
+        available_storage_mb: 0,
+        usage_percent: 0
+      })
     } finally {
       setLoadingStorage(false)
     }
   }
 
   async function handleDelete(dbId){
-    if(!confirm('Bạn có chắc muốn xóa database này?')) return
+    if(!window.confirm('Bạn có chắc muốn xóa database này?')) return
     try {
       const res = await fetch(`${API_URL}/db/${dbId}`, {
         method: 'DELETE',
         headers: { 'Authorization': `Bearer ${token}` }
       })
+      const data = await res.json()
       if(res.ok){
+        setSuccess('Xóa database thành công!')
         fetchDbs()
+        setTimeout(() => setSuccess(null), 5000)
       } else {
-        alert('Xóa thất bại')
+        setError(data.detail || 'Xóa thất bại')
       }
     } catch(err) {
-      alert('Lỗi: ' + err)
+      setError('Lỗi kết nối: ' + err.message)
     }
   }
 
@@ -124,33 +150,23 @@ export default function Databases(){
                 <option value="DELETED">DELETED</option>
               </select>
             </div>
-            <label style={{display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', fontSize: '14px'}}>
-              <input 
-                type="checkbox" 
-                checked={testMode}
-                onChange={(e) => {
-                  const enabled = e.target.checked
-                  setTestMode(enabled)
-                  localStorage.setItem('db_test_mode', enabled.toString())
-                  // Reload stats để áp dụng test mode
-                  fetchDbs()
-                }}
-                style={{width: '18px', height: '18px', cursor: 'pointer'}}
-              />
-              <span style={{color: testMode ? '#f59e0b' : '#64748b', fontWeight: testMode ? 'bold' : 'normal'}}>
-                🧪 Chế độ Test (Random data)
-              </span>
-            </label>
-            <button className="btn-primary" onClick={() => setShowCreateForm(true)}>
-              ➕ Tạo Database mới
+            <button className="btn-primary" onClick={() => setShowCreateForm(true)} style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+              <FiPlus size={16} /> Tạo Database mới
             </button>
           </div>
         </div>
 
+        {error && <ErrorMessage message={error} onClose={() => setError(null)} />}
+        {success && <SuccessMessage message={success} onClose={() => setSuccess(null)} autoClose={true} />}
+
         {showCreateForm && (
           <CreateDatabaseForm 
             onClose={() => setShowCreateForm(false)} 
-            onSuccess={() => { setShowCreateForm(false); fetchDbs(); }}
+            onSuccess={(message) => { 
+              if(message) setSuccess(message)
+              setShowCreateForm(false); 
+              fetchDbs(); 
+            }}
             token={token}
           />
         )}
@@ -159,25 +175,25 @@ export default function Databases(){
         {loadingStorage && (
           <div className="loading">Đang tải thông tin dung lượng...</div>
         )}
-        {!loadingStorage && storageInfo && storageInfo.has_subscription && storageInfo.storage && (
+        {!loadingStorage && storageInfo && storageInfo.has_subscription && (
           <div style={{marginBottom: '16px', padding: '14px 16px', borderRadius: '10px', background: '#0f172a', color: '#e5e7eb', boxShadow: '0 18px 45px rgba(15,23,42,0.45)', border: '1px solid rgba(148,163,184,0.3)'}}>
             <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px'}}>
               <div style={{fontSize: '13px', textTransform: 'uppercase', letterSpacing: '0.08em', color: '#9ca3af'}}>
                 Tổng dung lượng đã dùng / Giới hạn gói
               </div>
               <div style={{fontSize: '13px', color: '#e5e7eb'}}>
-                {storageInfo.storage.used_mb} MB / {storageInfo.storage.plan_limit_mb} MB
+                {(storageInfo.used_storage_mb || 0).toFixed(2)} MB / {storageInfo.total_storage_mb || 0} MB
               </div>
             </div>
             <div style={{height: '8px', borderRadius: '999px', background: 'rgba(15,23,42,0.9)', overflow: 'hidden', border: '1px solid rgba(55,65,81,0.9)'}}>
               <div
                 style={{
                   height: '100%',
-                  width: `${Math.min(100, storageInfo.storage.used_percent || 0)}%`,
+                  width: `${Math.min(100, storageInfo.usage_percent || 0)}%`,
                   borderRadius: '999px',
-                  background: storageInfo.storage.quota_status === 'BLOCKED'
+                  background: (storageInfo.usage_percent || 0) >= 100
                     ? 'linear-gradient(90deg,#ef4444,#b91c1c)'
-                    : storageInfo.storage.quota_status === 'WARNING'
+                    : (storageInfo.usage_percent || 0) >= 80
                     ? 'linear-gradient(90deg,#f59e0b,#d97706)'
                     : 'linear-gradient(90deg,#22c55e,#16a34a)',
                   boxShadow: '0 0 18px rgba(34,197,94,0.5)'
@@ -186,37 +202,38 @@ export default function Databases(){
             </div>
             <div style={{marginTop: '6px', fontSize: '12px', color: '#9ca3af', display: 'flex', justifyContent: 'space-between'}}>
               <span>
-                Đã dùng khoảng {Math.round(storageInfo.storage.used_percent || 0)}% dung lượng gói.
+                Đã dùng khoảng {Math.round(storageInfo.usage_percent || 0)}% dung lượng gói{storageInfo.plan_name ? ` (${storageInfo.plan_name})` : ''}.
               </span>
-              {storageInfo.storage.quota_status === 'WARNING' && (
-                <span style={{color: '#fbbf24'}}>⚠️ Gần chạm giới hạn, cân nhắc nâng cấp gói.</span>
+              {(storageInfo.usage_percent || 0) >= 80 && (storageInfo.usage_percent || 0) < 100 && (
+                <span style={{color: '#fbbf24', display: 'flex', alignItems: 'center', gap: '4px'}}><FiAlertTriangle size={12} /> Gần chạm giới hạn, cân nhắc nâng cấp gói.</span>
               )}
-              {storageInfo.storage.quota_status === 'BLOCKED' && (
-                <span style={{color: '#fca5a5'}}>🚫 Đã vượt giới hạn, một số kết nối có thể bị khóa.</span>
+              {(storageInfo.usage_percent || 0) >= 100 && (
+                <span style={{color: '#fca5a5', display: 'flex', alignItems: 'center', gap: '4px'}}><FiAlertTriangle size={12} /> Đã vượt giới hạn, một số kết nối có thể bị khóa.</span>
               )}
             </div>
           </div>
         )}
 
-        {error && <div className="alert alert-error">{error}</div>}
+        {error && <ErrorMessage message={error} onClose={() => setError(null)} />}
+        {success && <SuccessMessage message={success} onClose={() => setSuccess(null)} autoClose={true} />}
         {loading && <div className="loading">Đang tải...</div>}
 
         {!loading && !error && (
           <div className="databases-grid">
             {dbs.length === 0 ? (
               <div className="empty-state">
-                <div className="empty-icon">🗄️</div>
+                <div className="empty-icon"><FiDatabase size={48} style={{color: '#9ca3af'}} /></div>
                 <h3>Chưa có database nào</h3>
                 <p>Bắt đầu bằng cách tạo database đầu tiên của bạn</p>
-                <p style={{fontSize: '13px', color: '#64748b', marginTop: '8px'}}>
-                  ⚠️ Lưu ý: Bạn cần đăng ký gói dịch vụ trước khi tạo database
+                <p style={{fontSize: '13px', color: '#64748b', marginTop: '8px', display: 'flex', alignItems: 'center', gap: '6px', justifyContent: 'center'}}>
+                  <FiAlertTriangle size={14} /> Lưu ý: Bạn cần đăng ký gói dịch vụ trước khi tạo database
                 </p>
                 <div style={{display: 'flex', gap: '12px', marginTop: '16px'}}>
-                  <button className="btn-primary" onClick={() => setShowCreateForm(true)}>
-                    Tạo Database
+                  <button className="btn-primary" onClick={() => setShowCreateForm(true)} style={{display: 'flex', alignItems: 'center', gap: '6px'}}>
+                    <FiPlus size={16} /> Tạo Database
                   </button>
-                  <Link to="/app/subscriptions" className="btn-secondary">
-                    Đăng ký gói
+                  <Link to="/app/subscriptions" className="btn-secondary" style={{textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: '6px'}}>
+                    <FiPackage size={16} /> Đăng ký gói
                   </Link>
                 </div>
               </div>
@@ -227,30 +244,27 @@ export default function Databases(){
                   db={db} 
                   onDelete={handleDelete}
                   token={token}
-                  testMode={testMode}
                 />
               ))
             )}
           </div>
         )}
+        <Footer />
       </div>
     </div>
   )
 }
 
-function DatabaseCard({ db, onDelete, token, testMode = false }){
+function DatabaseCard({ db, onDelete, token }){
+  const navigate = useNavigate()
   const [stats, setStats] = useState(null)
   const [loadingStats, setLoadingStats] = useState(false)
-  const [showConnectionInfo, setShowConnectionInfo] = useState(false)
-  const [showResetPassword, setShowResetPassword] = useState(false)
 
   async function loadStats(){
     setLoadingStats(true)
     try {
       const url = new URL(`${API_URL}/db/${db.id}/stats`)
-      if(testMode) {
-        url.searchParams.set('test_mode', 'true')
-      }
+      // Removed test mode
       const res = await fetch(url, {
         headers: { 'Authorization': `Bearer ${token}` }
       })
@@ -267,7 +281,7 @@ function DatabaseCard({ db, onDelete, token, testMode = false }){
 
   useEffect(() => {
     if(db.status === 'ACTIVE' || db.status === 'BLOCKED') loadStats()
-  }, [db.id, testMode])
+  }, [db.id])
 
   const statusColors = {
     ACTIVE: '#10b981',
@@ -299,27 +313,45 @@ function DatabaseCard({ db, onDelete, token, testMode = false }){
                   color: quotaStatusColors[stats.quota_status],
                   fontSize: '11px'
                 }}>
-                  {stats.quota_status === 'WARNING' ? '⚠️ CẢNH BÁO' : '🚫 BỊ KHÓA'}
+                  {stats.quota_status === 'WARNING' ? (
+                    <>
+                      <FiAlertTriangle size={12} style={{ marginRight: '4px', verticalAlign: 'middle' }} /> CẢNH BÁO
+                    </>
+                  ) : (
+                    <>
+                      <FiAlertTriangle size={12} style={{ marginRight: '4px', verticalAlign: 'middle' }} /> BỊ KHÓA
+                    </>
+                  )}
                 </span>
               )}
             </div>
           </div>
           <div className="database-actions">
             <button className="btn-icon" onClick={loadStats} title="Làm mới">
-              🔄
+              <FiRefreshCw size={16} />
             </button>
             {db.status === 'ACTIVE' && (
-              <>
-                <button className="btn-icon" onClick={() => setShowConnectionInfo(true)} title="Thông tin kết nối">
-                  🔌
-                </button>
-                <button className="btn-icon" onClick={() => setShowResetPassword(true)} title="Đổi mật khẩu">
-                  🔑
-                </button>
-              </>
+              <button 
+                className="btn-icon" 
+                onClick={() => navigate(`/app/databases/${db.id}`)} 
+                title="Xem chi tiết & Quản lý"
+                style={{
+                  backgroundColor: '#3b82f6',
+                  color: 'white',
+                  padding: '6px 12px',
+                  borderRadius: '6px',
+                  fontSize: '13px',
+                  fontWeight: '500',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '6px'
+                }}
+              >
+                <FiEye size={14} /> Xem chi tiết
+              </button>
             )}
             <button className="btn-icon btn-danger" onClick={() => onDelete(db.id)} title="Xóa">
-              🗑️
+              <FiTrash2 size={16} />
             </button>
           </div>
         </div>
@@ -347,14 +379,14 @@ function DatabaseCard({ db, onDelete, token, testMode = false }){
 
         {stats && stats.quota_status === 'BLOCKED' && (
           <div className="alert alert-error" style={{marginTop: '12px', padding: '12px', fontSize: '13px'}}>
-            <strong>🚫 Database bị khóa!</strong><br/>
+            <strong style={{display: 'flex', alignItems: 'center', gap: '6px'}}><FiLock size={16} /> Database bị khóa!</strong><br/>
             Dung lượng lưu trữ đã đạt/quá giới hạn của gói dịch vụ. Vui lòng nâng cấp gói hoặc xóa bớt dữ liệu để tiếp tục sử dụng.
           </div>
         )}
 
         {stats && stats.quota_status === 'WARNING' && (
           <div className="alert alert-warning" style={{marginTop: '12px', padding: '12px', fontSize: '13px'}}>
-            <strong>⚠️ Cảnh báo!</strong><br/>
+            <strong style={{display: 'flex', alignItems: 'center', gap: '6px'}}><FiAlertTriangle size={16} /> Cảnh báo!</strong><br/>
             Dung lượng lưu trữ đang gần đạt giới hạn. Hãy xem xét nâng cấp gói dịch vụ hoặc xóa bớt dữ liệu.
           </div>
         )}
@@ -378,22 +410,7 @@ function DatabaseCard({ db, onDelete, token, testMode = false }){
         )}
       </div>
 
-      {showConnectionInfo && (
-        <ConnectionInfoModal 
-          dbId={db.id} 
-          token={token}
-          onClose={() => setShowConnectionInfo(false)} 
-        />
-      )}
-
-      {showResetPassword && (
-        <ResetPasswordModal 
-          dbId={db.id} 
-          token={token}
-          onClose={() => setShowResetPassword(false)}
-          onSuccess={() => { setShowResetPassword(false); alert('Đổi mật khẩu thành công!') }}
-        />
-      )}
+      {/* All modals removed - features moved to DatabaseDetail page */}
     </>
   )
 }
@@ -450,13 +467,13 @@ function CreateDatabaseForm({ onClose, onSuccess, token }){
       })
       const data = await res.json()
       if(res.ok){
-        onSuccess()
+        onSuccess('Tạo database thành công! Database đang được khởi tạo.')
       } else {
         const errorMsg = data.detail || 'Tạo database thất bại'
         if(errorMsg.includes('active subscription')){
-          setError(`❌ ${errorMsg}\n\nVui lòng đăng ký gói dịch vụ trước khi tạo database.`)
+          setError(`${errorMsg}\n\nVui lòng đăng ký gói dịch vụ trước khi tạo database.`)
         } else if(errorMsg.includes('Quota exceeds')){
-          setError(`❌ ${errorMsg}`)
+          setError(errorMsg)
         } else {
           setError(errorMsg)
         }
@@ -483,7 +500,7 @@ function CreateDatabaseForm({ onClose, onSuccess, token }){
             <div className="loading">Đang tải thông tin gói dịch vụ...</div>
           ) : storageInfo && !storageInfo.has_subscription ? (
             <div className="alert alert-error">
-              <strong>⚠️ Chưa có gói dịch vụ:</strong> {storageInfo.message}
+              <strong style={{display: 'flex', alignItems: 'center', gap: '6px'}}><FiAlertTriangle size={16} /> Chưa có gói dịch vụ:</strong> {storageInfo.message}
               <div style={{marginTop: '12px'}}>
                 <Link to="/app/subscriptions" className="btn-primary" style={{textDecoration: 'none', display: 'inline-block'}}>
                   Đăng ký gói ngay
@@ -492,36 +509,36 @@ function CreateDatabaseForm({ onClose, onSuccess, token }){
             </div>
           ) : storageInfo && storageInfo.has_subscription ? (
             <div className="alert alert-info" style={{background: '#eff6ff', border: '1px solid #3b82f6', padding: '16px', borderRadius: '8px', marginBottom: '20px'}}>
-              <h3 style={{margin: '0 0 12px 0', fontSize: '16px', color: '#1e40af'}}>📦 Thông tin gói dịch vụ</h3>
+              <h3 style={{margin: '0 0 12px 0', fontSize: '16px', color: '#1e40af', display: 'flex', alignItems: 'center', gap: '8px'}}><FiPackage size={18} /> Thông tin gói dịch vụ</h3>
               <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginBottom: '12px'}}>
                 <div>
-                  <strong>Gói đang dùng:</strong> {storageInfo.subscription.plan_name}
+                  <strong>Gói đang dùng:</strong> {storageInfo.plan_name || 'N/A'}
                 </div>
                 <div>
-                  <strong>Hạn sử dụng:</strong> {storageInfo.subscription.expires_at ? new Date(storageInfo.subscription.expires_at).toLocaleDateString('vi-VN') : 'N/A'}
+                  <strong>Dung lượng gói:</strong> {storageInfo.total_storage_mb} MB
                 </div>
               </div>
               <div style={{marginTop: '12px', padding: '12px', background: '#f8fafc', borderRadius: '6px'}}>
                 <div style={{display: 'flex', justifyContent: 'space-between', marginBottom: '8px', fontSize: '14px'}}>
-                  <span><strong>Dung lượng đã dùng:</strong> {storageInfo.storage.used_mb} MB / {storageInfo.storage.plan_limit_mb} MB</span>
-                  <span style={{color: storageInfo.storage.used_percent > 80 ? '#ef4444' : '#10b981', fontWeight: 'bold'}}>
-                    {storageInfo.storage.used_percent}%
+                  <span><strong>Dung lượng đã dùng:</strong> {(storageInfo.used_storage_mb || 0).toFixed(2)} MB / {storageInfo.total_storage_mb || 0} MB</span>
+                  <span style={{color: (storageInfo.usage_percent || 0) > 80 ? '#ef4444' : '#10b981', fontWeight: 'bold'}}>
+                    {(storageInfo.usage_percent || 0).toFixed(2)}%
                   </span>
                 </div>
                 <div style={{height: '8px', background: '#e2e8f0', borderRadius: '4px', overflow: 'hidden'}}>
                   <div 
                     style={{
                       height: '100%', 
-                      width: `${storageInfo.storage.used_percent}%`, 
-                      background: storageInfo.storage.used_percent > 80 ? '#ef4444' : storageInfo.storage.used_percent > 60 ? '#f59e0b' : '#10b981',
+                      width: `${Math.min(100, storageInfo.usage_percent || 0)}%`, 
+                      background: (storageInfo.usage_percent || 0) >= 100 ? '#ef4444' : (storageInfo.usage_percent || 0) > 80 ? '#f59e0b' : '#10b981',
                       transition: 'width 0.3s'
                     }}
                   />
                 </div>
                 <div style={{marginTop: '8px', fontSize: '13px', color: '#64748b'}}>
-                  <strong>Còn trống:</strong> {storageInfo.storage.available_mb} MB
-                  {storageInfo.storage.available_mb === 0 && (
-                    <span style={{color: '#ef4444', marginLeft: '8px'}}>⚠️ Đã hết dung lượng!</span>
+                  <strong>Còn trống:</strong> {(storageInfo.available_storage_mb || 0).toFixed(2)} MB
+                  {(storageInfo.available_storage_mb || 0) <= 0 && (
+                    <span style={{color: '#ef4444', marginLeft: '8px', display: 'flex', alignItems: 'center', gap: '4px'}}><FiAlertTriangle size={14} /> Đã hết dung lượng!</span>
                   )}
                 </div>
               </div>
@@ -566,24 +583,24 @@ function CreateDatabaseForm({ onClose, onSuccess, token }){
               onChange={e => {
                 const value = e.target.value ? parseInt(e.target.value) : null
                 if(value !== null){
-                  const maxQuota = storageInfo?.has_subscription ? storageInfo.storage.available_mb : 999999
+                  const maxQuota = storageInfo?.has_subscription ? (storageInfo.available_storage_mb || 0) : 999999
                   setFormData({...formData, quota_mb: Math.min(value, maxQuota)})
                 } else {
                   setFormData({...formData, quota_mb: null})
                 }
               }}
               min="1"
-              max={storageInfo?.has_subscription ? storageInfo.storage.available_mb : undefined}
+              max={storageInfo?.has_subscription ? (storageInfo.available_storage_mb || 0) : undefined}
               placeholder="Để trống nếu không cần"
             />
             <p className="hint" style={{marginTop: '4px', fontSize: '12px', color: '#64748b'}}>
               ⓘ Quota này chỉ để hiển thị ước tính. Database không bị giới hạn dung lượng riêng lẻ.
               <br/>
-              Giới hạn thực tế dựa trên tổng dung lượng của gói dịch vụ ({storageInfo?.has_subscription ? storageInfo.storage.plan_limit_mb : 'N/A'} MB).
+              Giới hạn thực tế dựa trên tổng dung lượng của gói dịch vụ ({storageInfo?.has_subscription ? (storageInfo.total_storage_mb || 0) : 'N/A'} MB).
             </p>
             {storageInfo?.has_subscription && (
               <p className="hint" style={{marginTop: '4px', fontSize: '12px', color: '#64748b'}}>
-                Dung lượng đã dùng: {storageInfo.storage.used_mb} MB / {storageInfo.storage.plan_limit_mb} MB ({storageInfo.storage.used_percent}%)
+                Dung lượng đã dùng: {(storageInfo.used_storage_mb || 0).toFixed(2)} MB / {storageInfo.total_storage_mb || 0} MB ({(storageInfo.usage_percent || 0).toFixed(2)}%)
               </p>
             )}
           </div>
@@ -626,9 +643,12 @@ function ConnectionInfoModal({ dbId, token, onClose }){
     fetchConnectionInfo()
   }, [dbId, token])
 
+  const [copySuccess, setCopySuccess] = useState(null)
+  
   function copyToClipboard(text){
     navigator.clipboard.writeText(text)
-    alert('Đã sao chép!')
+    setCopySuccess('Đã sao chép!')
+    setTimeout(() => setCopySuccess(null), 2000)
   }
 
   return (
@@ -640,49 +660,50 @@ function ConnectionInfoModal({ dbId, token, onClose }){
         </div>
         <div className="modal-body">
           {loading && <div className="loading">Đang tải...</div>}
-          {error && <div className="alert alert-error">{error}</div>}
+          {error && <ErrorMessage message={error} onClose={() => setError(null)} />}
+          {copySuccess && <SuccessMessage message={copySuccess} onClose={() => setCopySuccess(null)} autoClose={true} autoCloseDelay={2000} />}
           {connectionInfo && (
             <div className="connection-info">
               <div className="info-group">
                 <label>Hostname</label>
                 <div className="info-value-with-copy">
                   <code>{connectionInfo.hostname}</code>
-                  <button className="btn-copy" onClick={() => copyToClipboard(connectionInfo.hostname)}>📋</button>
+                  <button className="btn-copy" onClick={() => copyToClipboard(connectionInfo.hostname)}><FiClipboard size={16} /></button>
                 </div>
               </div>
               <div className="info-group">
                 <label>Port</label>
                 <div className="info-value-with-copy">
                   <code>{connectionInfo.port}</code>
-                  <button className="btn-copy" onClick={() => copyToClipboard(String(connectionInfo.port))}>📋</button>
+                  <button className="btn-copy" onClick={() => copyToClipboard(String(connectionInfo.port))}><FiClipboard size={16} /></button>
                 </div>
               </div>
               <div className="info-group">
                 <label>Database Name</label>
                 <div className="info-value-with-copy">
                   <code>{connectionInfo.database_name}</code>
-                  <button className="btn-copy" onClick={() => copyToClipboard(connectionInfo.database_name)}>📋</button>
+                  <button className="btn-copy" onClick={() => copyToClipboard(connectionInfo.database_name)}><FiClipboard size={16} /></button>
                 </div>
               </div>
               <div className="info-group">
                 <label>Username</label>
                 <div className="info-value-with-copy">
                   <code>{connectionInfo.username}</code>
-                  <button className="btn-copy" onClick={() => copyToClipboard(connectionInfo.username)}>📋</button>
+                  <button className="btn-copy" onClick={() => copyToClipboard(connectionInfo.username)}><FiClipboard size={16} /></button>
                 </div>
               </div>
               <div className="info-group">
                 <label>Password</label>
                 <div className="info-value-with-copy">
                   <code>{connectionInfo.password}</code>
-                  <button className="btn-copy" onClick={() => copyToClipboard(connectionInfo.password)}>📋</button>
+                  <button className="btn-copy" onClick={() => copyToClipboard(connectionInfo.password)}><FiClipboard size={16} /></button>
                 </div>
               </div>
               <div className="info-group">
                 <label>Connection String</label>
                 <div className="info-value-with-copy">
                   <code className="connection-string">{connectionInfo.connection_string}</code>
-                  <button className="btn-copy" onClick={() => copyToClipboard(connectionInfo.connection_string)}>📋</button>
+                  <button className="btn-copy" onClick={() => copyToClipboard(connectionInfo.connection_string)}><FiClipboard size={16} /></button>
                 </div>
               </div>
               
@@ -692,13 +713,13 @@ function ConnectionInfoModal({ dbId, token, onClose }){
                     <label>JDBC URL (cho DBeaver, MySQL Workbench, etc.)</label>
                     <div className="info-value-with-copy">
                       <code className="connection-string">{connectionInfo.jdbc_url}</code>
-                      <button className="btn-copy" onClick={() => copyToClipboard(connectionInfo.jdbc_url)}>📋</button>
+                      <button className="btn-copy" onClick={() => copyToClipboard(connectionInfo.jdbc_url)}><FiClipboard size={16} /></button>
                     </div>
                 
                   </div>
                   
                   <div className="alert alert-info" style={{marginTop: '16px', padding: '12px'}}>
-                    <strong>📖 Hướng dẫn kết nối DBeaver:</strong>
+                    <strong style={{display: 'flex', alignItems: 'center', gap: '6px'}}><FiBookOpen size={16} /> Hướng dẫn kết nối DBeaver:</strong>
                     <ol style={{marginTop: '8px', paddingLeft: '20px', fontSize: '13px'}}>
                       <li>Tạo connection mới: Database → New Database Connection → MySQL</li>
                       <li>Nhập thông tin:
@@ -763,7 +784,7 @@ function ResetPasswordModal({ dbId, token, onClose, onSuccess }){
       })
       const data = await res.json()
       if(res.ok){
-        onSuccess()
+        onSuccess('Đổi mật khẩu database thành công!')
       } else {
         setError(data.detail || 'Đổi mật khẩu thất bại')
       }
@@ -822,37 +843,52 @@ function Sidebar(){
   return (
     <aside className="sidebar">
       <div className="sidebar-header">
-        <h2>CloudDB</h2>
+        <div style={{display: 'flex', alignItems: 'center', gap: '12px'}}>
+          <div style={{
+            width: '40px',
+            height: '40px',
+            borderRadius: '10px',
+            background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            fontSize: '24px',
+            boxShadow: '0 4px 6px rgba(102, 126, 234, 0.3)'
+          }}>
+            <FiDatabase size={24} />
+          </div>
+          <h2 style={{margin: 0, fontSize: '24px', fontWeight: '700', background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text'}}>CloudDB</h2>
+        </div>
       </div>
       <nav className="sidebar-nav">
         <Link to="/app" className="nav-item">
-          <span className="nav-icon">🏠</span>
+          <span className="nav-icon"><FiHome size={18} /></span>
           <span>Trang chủ</span>
         </Link>
         <Link to="/app/databases" className="nav-item active">
-          <span className="nav-icon">🗄️</span>
+          <span className="nav-icon"><FiDatabase size={18} /></span>
           <span>Quản lý Database</span>
         </Link>
         <Link to="/app/subscriptions" className="nav-item">
-          <span className="nav-icon">📦</span>
+          <span className="nav-icon"><FiPackage size={18} /></span>
           <span>Gói dịch vụ</span>
         </Link>
         <Link to="/app/payments" className="nav-item">
-          <span className="nav-icon">💳</span>
+          <span className="nav-icon"><FiCreditCard size={18} /></span>
           <span>Thanh toán</span>
         </Link>
         <Link to="/app/usage" className="nav-item">
-          <span className="nav-icon">📊</span>
+          <span className="nav-icon"><FiBarChart2 size={18} /></span>
           <span>Thống kê</span>
         </Link>
         <Link to="/app/profile" className="nav-item">
-          <span className="nav-icon">👤</span>
+          <span className="nav-icon"><FiUser size={18} /></span>
           <span>Tài khoản</span>
         </Link>
       </nav>
       <div className="sidebar-footer">
         <button className="logout-btn" onClick={() => { clearToken(); window.location.href = '/login' }}>
-          <span className="nav-icon">🚪</span>
+          <span className="nav-icon"><FiLogOut size={18} /></span>
           <span>Đăng xuất</span>
         </button>
       </div>
